@@ -34,10 +34,14 @@ Supabase → **SQL Editor** 에서 [`sql/crawler_role.sql`](sql/crawler_role.sql
 비밀번호 자리를 강력한 값으로 바꿔 실행한다. 이 롤은 `player.players` 읽기 +
 `player.player_price_latest` 읽기/쓰기만 가능하다(슈퍼유저 아님).
 
-접속문자열 형태:
+접속문자열 형태 ⚠️ **반드시 "Session pooler"(IPv4) 주소를 쓸 것** — GitHub Actions 는
+IPv6 를 지원하지 않는데, Supabase 의 "직접 연결"(`db.<ref>.supabase.co`)은 IPv6 전용이라
+`Network is unreachable` 로 실패한다. Supabase → **Connect → Session pooler** 탭의 주소를 쓰고,
+유저명은 `<role>.<프로젝트ref>` 형식(점+ref)이라는 점에 주의:
 ```
-postgresql://fco_crawler:비밀번호@db.<프로젝트ref>.supabase.co:5432/postgres
+postgresql://fco_crawler.<프로젝트ref>:비밀번호@aws-1-<region>.pooler.supabase.com:5432/postgres
 ```
+(직접 연결 `postgresql://fco_crawler:비밀번호@db.<ref>.supabase.co:5432/postgres` 는 로컬 테스트용으로만)
 
 ### 2) GitHub Secret 등록
 이 저장소 → **Settings → Secrets and variables → Actions → New repository secret**
