@@ -1,0 +1,23 @@
+# 🔒 비밀정보는 절대 커밋 금지 (DATABASE_URL 은 GitHub Secret 으로만!)
+.env
+.env.*
+!.env.example
+
+# 파이썬 캐시
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 가상환경
+venv/
+.venv/
+env/
+
+# 에디터
+.vscode/
+.idea/
+*.swp
+
+# 로그/임시
+*.log
+*.tmp

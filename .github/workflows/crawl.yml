@@ -1,0 +1,72 @@
+name: crawl-prices
+
+# 넥슨 시세는 하루 1회 갱신이라 1일 1회가 의미 있는 최대치다.
+# 공개 저장소이므로 GitHub Actions 분(分)은 무제한 → 비용 0원.
+on:
+  schedule:
+    # UTC 기준. "0 20 * * *" = 매일 20:00 UTC = 한국시간(KST) 다음날 05:00 새벽.
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "테스트용 spid 수 상한 (0=전체)"
+        required: false
+        default: "0"
+      strongs:
+        description: "강화단계 (예: 1-13 / 1 / 1,5,8)"
+        required: false
+        default: "1-13"
+      workers:
+        description: "동시 요청 스레드 수(샤드당)"
+        required: false
+        default: "10"
+      request_delay:
+        description: "각 요청 후 sleep 초(레이트리밋 완화)"
+        required: false
+        default: "0.05"
+
+# 최소권한. ⚠️ pull_request 트리거는 절대 추가하지 말 것(외부 fork 의 시크릿 노출 방지).
+permissions:
+  contents: read
+
+# 실행이 겹치지 않게(이전 실행이 길어지면 다음 cron 은 대기).
+concurrency:
+  group: crawl-prices
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    # 단일 job 6시간 제한 회피용 안전 상한(6h = 360분). 샤딩으로 실제로는 훨씬 짧다.
+    timeout-minutes: 330
+    strategy:
+      # 한 샤드가 실패해도 나머지는 계속 진행(멱등이라 재실행으로 메움).
+      fail-fast: false
+      # ⚠️ 샤드 수를 바꾸려면 이 목록과 아래 SHARD_COUNT 를 함께 맞춰야 한다.
+      #    처음엔 보수적으로 4 샤드. 1회 측정 후 6~8 로 늘릴 수 있다.
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Crawl shard ${{ matrix.shard }}
+        env:
+          # 🔒 DB 접속문자열(주소+비밀번호)은 코드에 절대 두지 않는다. Secret 으로만 주입.
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_COUNT: "4"   # ⚠️ 위 matrix.shard 목록 길이와 반드시 동일하게.
+          PRICE_LATEST_STRONGS: ${{ github.event.inputs.strongs || '1-13' }}
+          PRICE_LATEST_WORKERS: ${{ github.event.inputs.workers || '10' }}
+          PRICE_LATEST_REQUEST_DELAY: ${{ github.event.inputs.request_delay || '0.05' }}
+          PRICE_LATEST_LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: python crawler_job.py
