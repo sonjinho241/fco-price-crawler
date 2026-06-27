@@ -2,10 +2,22 @@ name: crawl-prices
 
 # 넥슨 시세는 하루 1회 갱신이라 1일 1회가 의미 있는 최대치다.
 # 공개 저장소이므로 GitHub Actions 분(分)은 무제한 → 비용 0원.
+#
+# ⚙️ Disk IO 예산 대응: 예전엔 새벽 한 창(20:00 UTC)에 4 샤드를 "동시에" 돌려
+#    Supabase 에 IO 를 몰아 태웠다(2h 폭주 → 크레딧 소진). 이제는 하루를
+#    6 토막(4시간 간격)으로 펴서, 각 토막이 전체 spid 의 1/6 만 담당한다.
+#    동시 커넥션 4→1, 순간 IO 가 baseline 밑으로 깔려 예산이 안 깎인다.
+#    넥슨이 하루 1회 갱신이라 24h 안에 한 바퀴만 돌면 신선도는 동일.
 on:
   schedule:
-    # UTC 기준. "0 20 * * *" = 매일 20:00 UTC = 한국시간(KST) 다음날 05:00 새벽.
-    - cron: "0 20 * * *"
+    # UTC 기준, 4시간 간격 6 토막. 각 cron → 아래 "Resolve shard" 의 샤드 인덱스.
+    # ⚠️ cron 목록을 바꾸면 아래 case 매핑과 SHARD_COUNT 를 반드시 함께 맞출 것.
+    - cron: "0 20 * * *"   # → shard 0 (KST 05:00)
+    - cron: "0 0 * * *"    # → shard 1 (KST 09:00)
+    - cron: "0 4 * * *"    # → shard 2 (KST 13:00)
+    - cron: "0 8 * * *"    # → shard 3 (KST 17:00)
+    - cron: "0 12 * * *"   # → shard 4 (KST 21:00)
+    - cron: "0 16 * * *"   # → shard 5 (KST 01:00)
   workflow_dispatch:
     inputs:
       limit:
@@ -17,7 +29,7 @@ on:
         required: false
         default: "1-13"
       workers:
-        description: "동시 요청 스레드 수(샤드당)"
+        description: "동시 요청 스레드 수"
         required: false
         default: "10"
       request_delay:
@@ -29,7 +41,7 @@ on:
 permissions:
   contents: read
 
-# 실행이 겹치지 않게(이전 실행이 길어지면 다음 cron 은 대기).
+# 실행이 겹치지 않게(이전 토막이 길어지면 다음 cron 은 대기).
 concurrency:
   group: crawl-prices
   cancel-in-progress: false
@@ -37,15 +49,8 @@ concurrency:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    # 단일 job 6시간 제한 회피용 안전 상한(6h = 360분). 샤딩으로 실제로는 훨씬 짧다.
-    timeout-minutes: 330
-    strategy:
-      # 한 샤드가 실패해도 나머지는 계속 진행(멱등이라 재실행으로 메움).
-      fail-fast: false
-      # ⚠️ 샤드 수를 바꾸려면 이 목록과 아래 SHARD_COUNT 를 함께 맞춰야 한다.
-      #    처음엔 보수적으로 4 샤드. 1회 측정 후 6~8 로 늘릴 수 있다.
-      matrix:
-        shard: [0, 1, 2, 3]
+    # 단일 job 6시간 제한 회피용 안전 상한. 한 토막은 1/6 분량이라 실제로는 훨씬 짧다.
+    timeout-minutes: 200
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -59,12 +64,37 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Crawl shard ${{ matrix.shard }}
+      # 어떤 cron 이 트리거했는지(github.event.schedule)로 이번에 돌릴 샤드를 정한다.
+      # 수동 실행(workflow_dispatch)은 schedule 이 비어 있으므로 전체 1회로 돈다.
+      - name: Resolve shard from schedule
+        id: slot
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            count=6
+            case "${{ github.event.schedule }}" in
+              "0 20 * * *") idx=0 ;;
+              "0 0 * * *")  idx=1 ;;
+              "0 4 * * *")  idx=2 ;;
+              "0 8 * * *")  idx=3 ;;
+              "0 12 * * *") idx=4 ;;
+              "0 16 * * *") idx=5 ;;
+              *)            idx=0 ;;   # 매핑 누락 시 안전 기본값
+            esac
+          else
+            # 수동 실행: 샤딩 없이 전체 spid 1회.
+            count=1
+            idx=0
+          fi
+          echo "shard_index=$idx" >> "$GITHUB_OUTPUT"
+          echo "shard_count=$count" >> "$GITHUB_OUTPUT"
+          echo "이번 실행: shard $idx / $count (event=${{ github.event_name }}, schedule='${{ github.event.schedule }}')"
+
+      - name: Crawl shard ${{ steps.slot.outputs.shard_index }}/${{ steps.slot.outputs.shard_count }}
         env:
           # 🔒 DB 접속문자열(주소+비밀번호)은 코드에 절대 두지 않는다. Secret 으로만 주입.
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          SHARD_INDEX: ${{ matrix.shard }}
-          SHARD_COUNT: "4"   # ⚠️ 위 matrix.shard 목록 길이와 반드시 동일하게.
+          SHARD_INDEX: ${{ steps.slot.outputs.shard_index }}
+          SHARD_COUNT: ${{ steps.slot.outputs.shard_count }}
           PRICE_LATEST_STRONGS: ${{ github.event.inputs.strongs || '1-13' }}
           PRICE_LATEST_WORKERS: ${{ github.event.inputs.workers || '10' }}
           PRICE_LATEST_REQUEST_DELAY: ${{ github.event.inputs.request_delay || '0.05' }}
