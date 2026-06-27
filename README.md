@@ -8,10 +8,33 @@ DB의 `player.player_price_latest` 테이블에 upsert 한다. 이 표 덕분에
 - **자기완결형**: `crawler_job.py` 하나로 끝. 메인(비공개) 앱 저장소를 체크아웃하지 않는다.
 - **멱등**: 중간에 죽어도 다시 돌리면 이어서 채워진다.
 - **비용 0원**: 공개 저장소는 Actions 분(分) 무제한.
-- **하루 1회만**: 넥슨 시세 자체가 하루 1회 갱신이라 1일 1회가 의미 있는 최대치.
+- **하루 6번 샤딩**: 넥슨 시세는 하루 1회 갱신이라 신선도는 1일 1바퀴면 충분하지만,
+  Supabase Disk IO 예산을 아끼려고 부하를 하루 6토막(4시간 간격)으로 펴서 각 토막이
+  전체 선수의 1/6만 담당한다. → 24시간에 한 바퀴.
 
 > ⚠️ 이 저장소에는 **크롤링 로직만** 공개된다(민감정보 아님). DB 접속문자열
 > (`DATABASE_URL`)은 **절대 코드/파일에 두지 않고** GitHub Secret 으로만 주입한다.
+
+---
+
+## 🤖 운영 요약 — 시세 배치가 "어디서·언제·어떻게" 도는가 (사람/AI 필독)
+
+> 이 표가 메인 앱(`fco_manager`)에서 "시세 배치 어디서 도냐"로 헤매지 않게 하는 단일 진실원본이다.
+
+- **어디서**: **이 저장소(`sonjinho241/fco-price-crawler`)의 GitHub Actions.** 메인 앱 Cloud Run 도,
+  Cloud Scheduler 도, 로컬 PC 도 **아니다.** 메인 레포 `prices/latest_job.py`·`prices/crud.py` 는
+  같은 로직의 **참고용 복사본일 뿐, 매일 실제로 DB 에 쓰는 건 여기다.**
+- **언제**: `.github/workflows/crawl.yml` 의 cron **6개**(UTC 20·0·4·8·12·16시 = KST 05·09·13·17·21·01시).
+  각 cron 이 샤드 인덱스 0~5 중 하나를 맡아 전체 spid 의 1/6 을 크롤한다.
+- **무엇을**: 넥슨에서 선수×강화단계당 최신 1줄을 받아 `player.player_price_latest` 에 upsert.
+  앱의 "강화단계+시세범위" **검색 필터 전용** 표다. (앱의 *시세 상세 그래프*는 이 표가 아니라
+  메인 앱 `prices/router.py` 의 넥슨 **실시간 프록시**+12h 캐시에서 온다 — 별개 경로.)
+- **Disk IO 보호 2종**: ① 하루 6토막 샤딩으로 **순간 폭주(burst) 제거**, ② `bulk_upsert_latest` 의
+  **no-op skip**(`where=price.is_distinct_from(excluded.price)`)으로 **안 바뀐 행은 안 씀**
+  → dead tuple/WAL 누적을 줄여 예산 소진을 막는다. (②가 없으면 매일 ~114만 행을 통째로
+  다시 써서 예산을 갉아먹는다 — 2026-06 Supabase 경고의 원인이었다.)
+- **변경 시 주의**: cron 개수를 바꾸면 `crawl.yml` 의 cron 목록·`Resolve shard` case 매핑·`SHARD_COUNT`
+  를 **셋 다 함께** 맞춰야 한다.
 
 ---
 
@@ -20,7 +43,7 @@ DB의 `player.player_price_latest` 테이블에 upsert 한다. 이 표 덕분에
 ```
 crawler_job.py                 # 자기완결형 크롤러 (이 파일 하나가 전부)
 requirements.txt               # requests, SQLAlchemy, psycopg2-binary
-.github/workflows/crawl.yml    # 매일 1회 cron + 수동 실행, 4-샤드 병렬
+.github/workflows/crawl.yml    # 하루 6회 cron(4시간 간격 샤딩) + 수동 실행
 sql/crawler_role.sql           # 최소권한 전용 DB 롤 생성 SQL (Supabase에서 1회 실행)
 .env.example                   # 로컬 테스트용 예시 (.env 는 커밋 금지)
 ```
@@ -66,8 +89,10 @@ GitHub → **Actions → crawl-prices → Run workflow** 에서 입력값을 주
 - 잘 되면 `limit` = `0`(전체), `strongs` = `1-13` 로 전체 1회 실행 → 소요시간 측정.
 
 ### 자동 실행 (cron)
-[`.github/workflows/crawl.yml`](.github/workflows/crawl.yml) 의 cron `0 20 * * *`
-= 매일 **20:00 UTC = 한국시간 다음날 05:00**. 기본 브랜치에서만 동작한다.
+[`.github/workflows/crawl.yml`](.github/workflows/crawl.yml) 에 cron 이 **6개**(UTC
+20·0·4·8·12·16시 = KST 05·09·13·17·21·01시) 있고, 각 cron 이 샤드 0~5 중 하나를 맡아
+전체 spid 의 1/6 만 크롤한다 → 24시간에 한 바퀴. 기본 브랜치에서만 동작한다.
+(부하를 하루 종일 펴서 Supabase Disk IO 의 순간 폭주를 막기 위한 구조.)
 
 ### 로컬 실행
 ```bash
@@ -78,23 +103,26 @@ PRICE_LATEST_LIMIT=20 PRICE_LATEST_STRONGS=1 python crawler_job.py
 
 ---
 
-## 샤딩 (6시간 작업 제한 회피)
+## 샤딩 (시간 분산 + Disk IO 보호)
 
-전체(약 8.7만 선수 × 13강)를 한 job 으로 돌리면 GitHub 의 단일 job 6시간 제한에 걸릴 수
-있다. 그래서 `matrix` 로 여러 샤드를 병렬 실행하고, 각 샤드는 `spids[SHARD_INDEX::SHARD_COUNT]`
-만 담당한다. 처음엔 **보수적으로 4 샤드**로 시작한다.
+전체(약 8.7만 선수 × 13강)를 한 번에 몰아 돌리면 ① GitHub 단일 job 6시간 제한에 걸릴 수 있고
+② Supabase Disk IO 예산을 순간에 몰아 태운다(과거 새벽 한 창에 4샤드 동시 실행 → 2h 폭주로
+크레딧 소진). 그래서 지금은 **시간(matrix 병렬) 대신 하루를 6토막으로 펴는 방식**을 쓴다.
+각 cron 슬롯이 샤드 인덱스 1개를 맡아 `spids[SHARD_INDEX::SHARD_COUNT]`(전체의 1/6)만 담당하고,
+4시간 간격이라 동시 커넥션이 1로 깔려 순간 IO 가 baseline 밑에 머문다.
 
-**샤드 수를 바꾸려면** `crawl.yml` 의 두 곳을 **함께** 맞춰야 한다:
+**슬롯(샤드) 수를 바꾸려면** [`crawl.yml`](.github/workflows/crawl.yml) 의 **세 곳을 함께** 맞춰야 한다:
 ```yaml
-matrix:
-  shard: [0, 1, 2, 3]   # ← 목록 길이
-...
-SHARD_COUNT: "4"          # ← 이 숫자 = 위 목록 길이
+on:
+  schedule:
+    - cron: "0 20 * * *"   # ← cron 1줄 = 샤드 1개 (줄 수 = 샤드 수)
+    ...
+# Resolve shard 스텝의 case 매핑 ("0 20 * * *") idx=0 ...  ← cron↔인덱스 대응
+count=6                     # ← 이 숫자 = 위 cron 줄 수
 ```
-예) 8 샤드로 늘리려면 `shard: [0,1,2,3,4,5,6,7]` + `SHARD_COUNT: "8"`.
 
-> ⚠️ 넥슨 차단 위험: 동시 부하 ≈ **샤드 수 × WORKERS**. 처음엔 샤드 4 / `WORKERS` 10 /
-> `REQUEST_DELAY` 0.05 로 1회 돌려 소요시간·차단 여부를 측정한 뒤 조절하라. 하루 1회만.
+> ⚠️ 넥슨 차단 위험: 한 슬롯의 동시 부하 ≈ **WORKERS**(샤드당). `WORKERS` 10 / `REQUEST_DELAY`
+> 0.05 가 기본. 한 슬롯은 전체의 1/6 분량이라 단일 job 6시간 제한에 한참 못 미친다.
 
 ---
 

@@ -165,7 +165,15 @@ def read_spids(conn) -> List[int]:
 
 
 def bulk_upsert_latest(conn, rows: List[dict]) -> int:
-    """최신 시세들을 player_price_latest 에 한 번에 upsert. 멱등. 반환=행 수."""
+    """최신 시세들을 player_price_latest 에 한 번에 upsert. 멱등. 반환=시도 행 수.
+
+    price 가 기존 값과 같으면 ON CONFLICT 시 UPDATE 를 건너뛴다
+    (where=price.is_distinct_from(excluded.price)). 시세는 대부분 날마다 안 바뀌는데,
+    안 바뀐 행까지 매번 다시 쓰면 dead tuple + WAL 이 매일 쌓여 Supabase 의
+    Disk IO 예산을 갉아먹는다(이 크롤러가 하루 6번 도므로 누적이 크다). 그래서
+    값이 실제로 변한 행만 쓴다. 이 때문에 updated_at 의 의미는 "마지막 확인 시각"이
+    아니라 "마지막으로 price 가 바뀐 시각"이 된다.
+    """
     if not rows:
         return 0
     stmt = insert(player_price_latest).values(rows)
@@ -176,6 +184,7 @@ def bulk_upsert_latest(conn, rows: List[dict]) -> int:
             "price_date": stmt.excluded.price_date,
             "updated_at": func.now(),
         },
+        where=player_price_latest.c.price.is_distinct_from(stmt.excluded.price),
     )
     conn.execute(stmt)
     conn.commit()
