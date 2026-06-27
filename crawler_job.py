@@ -191,6 +191,23 @@ def bulk_upsert_latest(conn, rows: List[dict]) -> int:
     return len(rows)
 
 
+def vacuum_analyze(engine) -> None:
+    """이번 샤드가 만든 dead tuple 을 배치 직후 즉시 회수한다(재발 방지의 본체).
+
+    no-op skip 으로 dead 생성은 이미 줄였지만, 바뀐 가격만큼은 매 회차 dead 가
+    생긴다. autovacuum 데몬을 기다리지 않고 쓰기 직후 한 번 VACUUM 해서, 비운 공간을
+    테이블 내부에서 곧장 재사용하게 만든다 → high-water mark(파일 크기) 가 다시
+    부풀지 않는다. ANALYZE 까지 묶어 (strong, price) 인덱스 통계도 최신으로 유지.
+    dead 가 적으면 visibility map 으로 깨끗한 페이지를 건너뛰므로 매우 가볍다.
+
+    ⚠️ VACUUM 은 트랜잭션 블록 안에서 못 돈다. AUTOCOMMIT 커넥션으로 실행한다.
+    ⚠️ VACUUM FULL 이 아니다(배타 락 없음). 일상 회수용이라 검색/배치를 막지 않는다.
+    """
+    sql = f"VACUUM (ANALYZE) {PLAYER_SCHEMA}.player_price_latest"
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(sql))
+
+
 # =============================================================================
 # 배치 본체
 # =============================================================================
@@ -326,6 +343,14 @@ def run() -> None:
             "배치 완료: tasks=%d written=%d elapsed=%.0fs",
             total, written, time.monotonic() - started,
         )
+
+    # 이번 샤드가 실제로 뭔가 썼을 때만 청소한다(안 바뀐 날 = dead 없음 = VACUUM 불필요).
+    if written:
+        try:
+            vacuum_analyze(engine)
+            logger.info("VACUUM (ANALYZE) 완료: %s.player_price_latest", PLAYER_SCHEMA)
+        except Exception as exc:  # 청소 실패가 배치 성공을 뒤집지 않게.
+            logger.warning("VACUUM 스킵(실패): %s", exc)
 
 
 if __name__ == "__main__":
