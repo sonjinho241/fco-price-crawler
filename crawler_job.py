@@ -49,7 +49,6 @@ from sqlalchemy import (
     create_engine,
     text,
 )
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.sql import func
 
 logger = logging.getLogger("price_latest_crawler")
@@ -164,11 +163,32 @@ def read_spids(conn) -> List[int]:
     return sorted({row[0] for row in rows})
 
 
+# 배치 행 수와 무관하게 SQL 텍스트가 항상 같아야 한다. insert().values(rows) 는
+# 행 수만큼 placeholder 가 늘어나 배치 크기별로 pg_stat_statements 에 "서로 다른
+# 쿼리"로 등록됐고(수천 엔트리 × 최대 17KB 텍스트), Supabase 모니터링이
+# pg_stat_statements 를 읽을 때마다 그 텍스트 전체(~66MB)가 temp 파일로 쏟아져
+# Disk IO 예산을 태웠다(2026-07 재발 원인). UNNEST(배열) 은 항상 한 가지 텍스트.
+_UPSERT_LATEST_SQL = text(f"""
+    INSERT INTO {PLAYER_SCHEMA}.player_price_latest (spid, strong, price, price_date)
+    SELECT * FROM unnest(
+        CAST(:spids AS bigint[]),
+        CAST(:strongs AS smallint[]),
+        CAST(:prices AS bigint[]),
+        CAST(:price_dates AS date[])
+    )
+    ON CONFLICT (spid, strong) DO UPDATE SET
+        price = EXCLUDED.price,
+        price_date = EXCLUDED.price_date,
+        updated_at = now()
+    WHERE player_price_latest.price IS DISTINCT FROM EXCLUDED.price
+""")
+
+
 def bulk_upsert_latest(conn, rows: List[dict]) -> int:
     """최신 시세들을 player_price_latest 에 한 번에 upsert. 멱등. 반환=시도 행 수.
 
     price 가 기존 값과 같으면 ON CONFLICT 시 UPDATE 를 건너뛴다
-    (where=price.is_distinct_from(excluded.price)). 시세는 대부분 날마다 안 바뀌는데,
+    (WHERE price IS DISTINCT FROM EXCLUDED.price). 시세는 대부분 날마다 안 바뀌는데,
     안 바뀐 행까지 매번 다시 쓰면 dead tuple + WAL 이 매일 쌓여 Supabase 의
     Disk IO 예산을 갉아먹는다(이 크롤러가 하루 6번 도므로 누적이 크다). 그래서
     값이 실제로 변한 행만 쓴다. 이 때문에 updated_at 의 의미는 "마지막 확인 시각"이
@@ -176,17 +196,15 @@ def bulk_upsert_latest(conn, rows: List[dict]) -> int:
     """
     if not rows:
         return 0
-    stmt = insert(player_price_latest).values(rows)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["spid", "strong"],
-        set_={
-            "price": stmt.excluded.price,
-            "price_date": stmt.excluded.price_date,
-            "updated_at": func.now(),
+    conn.execute(
+        _UPSERT_LATEST_SQL,
+        {
+            "spids": [r["spid"] for r in rows],
+            "strongs": [r["strong"] for r in rows],
+            "prices": [r["price"] for r in rows],
+            "price_dates": [r["price_date"] for r in rows],
         },
-        where=player_price_latest.c.price.is_distinct_from(stmt.excluded.price),
     )
-    conn.execute(stmt)
     conn.commit()
     return len(rows)
 
