@@ -168,6 +168,12 @@ def read_spids(conn) -> List[int]:
 # 쿼리"로 등록됐고(수천 엔트리 × 최대 17KB 텍스트), Supabase 모니터링이
 # pg_stat_statements 를 읽을 때마다 그 텍스트 전체(~66MB)가 temp 파일로 쏟아져
 # Disk IO 예산을 태웠다(2026-07 재발 원인). UNNEST(배열) 은 항상 한 가지 텍스트.
+#
+# ⚠️ 단, 배열을 "파이썬 리스트"로 바인드하면 안 된다(2026-07-13 재재발 원인).
+# psycopg2 는 리스트를 ARRAY[v1, v2, ...] 로 인라인하므로 원소 수만큼 상수가 생기고,
+# pg_stat_statements 가 배치 크기별로 또 별개 엔트리를 만든다(4,283 엔트리/59MB).
+# 반드시 _pg_array_literal() 로 '{...}' 문자열 하나로 직렬화해 넘겨야
+# 상수가 항상 1개($1)가 된다.
 _UPSERT_LATEST_SQL = text(f"""
     INSERT INTO {PLAYER_SCHEMA}.player_price_latest (spid, strong, price, price_date)
     SELECT * FROM unnest(
@@ -182,6 +188,23 @@ _UPSERT_LATEST_SQL = text(f"""
         updated_at = now()
     WHERE player_price_latest.price IS DISTINCT FROM EXCLUDED.price
 """)
+
+
+def _pg_array_literal(values) -> str:
+    """리스트를 Postgres 배열 리터럴 문자열('{...}') 하나로 직렬화한다.
+
+    psycopg2 의 리스트 어댑터(ARRAY[...] 인라인)를 우회해, 서버에는 문자열 상수
+    1개만 보내고 SQL 쪽 CAST 가 배열로 파싱하게 한다. 모든 원소를 "..." 로 감싸므로
+    숫자/날짜 어느 타입 배열로도 캐스팅된다. None 은 NULL.
+    """
+    parts = []
+    for v in values:
+        if v is None:
+            parts.append("NULL")
+        else:
+            s = str(v).replace("\\", "\\\\").replace('"', '\\"')
+            parts.append('"' + s + '"')
+    return "{" + ",".join(parts) + "}"
 
 
 def bulk_upsert_latest(conn, rows: List[dict]) -> int:
@@ -199,10 +222,10 @@ def bulk_upsert_latest(conn, rows: List[dict]) -> int:
     conn.execute(
         _UPSERT_LATEST_SQL,
         {
-            "spids": [r["spid"] for r in rows],
-            "strongs": [r["strong"] for r in rows],
-            "prices": [r["price"] for r in rows],
-            "price_dates": [r["price_date"] for r in rows],
+            "spids": _pg_array_literal(r["spid"] for r in rows),
+            "strongs": _pg_array_literal(r["strong"] for r in rows),
+            "prices": _pg_array_literal(r["price"] for r in rows),
+            "price_dates": _pg_array_literal(r["price_date"] for r in rows),
         },
     )
     conn.commit()
