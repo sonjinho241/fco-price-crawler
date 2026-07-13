@@ -1,0 +1,113 @@
+name: meta-thursday
+
+# FC온라인 정기 패치는 매주 목요일인데 "점검 종료 시각"이 매주 다르다. 그래서 고정
+# 시각 크롤 대신 **목 10:00~23:00 KST 매시 폴링**한다: sync(spid.json/seasonid.json
+# 업서트, 왕복 몇 번짜리 경량 작업)가 신규 spid/시즌을 감지한 그 시각에만 crawl 을
+# 돌려 신규 카드를 즉시 반영한다. 평상시(감지 0) 폴링은 crawl/notify 를 스킵해 무음.
+#
+# crawl 은 META_ONLY_NEW=1 로 crawled=FALSE(=방금 sync 가 넣은 신규 spid + 과거
+# 실패분)만 크롤하는 경량 단일 잡이다(신규 시즌 수백 장 = 수 분). 목요일 패치가
+# 기존 카드를 건드린 변경은 다음날 meta-friday.yml 풀크롤이 해시 diff 로 커버한다.
+#
+# 단계: sync(매시 폴링) → [감지 시에만] crawl(신규만) → notify(카톡 요약 1통).
+# 세 단계 모두 META_RUN_ID = github.run_id 로 묶여 meta_crawl_log 에서 집계된다.
+# workflow_dispatch 는 스모크 테스트용: 게이트를 무시하고 META_ONLY_NEW=0 + limit 으로
+# 파이프라인 전체(크롤→로그→알림)를 소량 검증한다.
+
+on:
+  schedule:
+    - cron: "0 1-14 * * 4"   # 목 01:00~14:00 UTC = 목 10:00~23:00 KST 매시 폴링
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "스모크 테스트용 spid 수 상한 (dispatch 는 ONLY_NEW 게이트 없이 앞에서부터 limit 장 크롤)"
+        required: false
+        default: "30"
+
+# 🔒 시크릿(DB·카카오·SMTP)은 코드에 두지 않는다. pull_request 트리거 금지(시크릿 노출 방지).
+permissions:
+  contents: read
+
+# 같은 워크플로가 겹쳐 돌지 않게. 크롤이 길어져 다음 정시 폴링과 겹치면 뒤 실행은 대기.
+concurrency:
+  group: meta-thursday
+  cancel-in-progress: false
+
+env:
+  META_RUN_ID: ${{ github.run_id }}
+
+jobs:
+  # ── 1) sync: spid.json/seasonid.json upsert + 신규 spid/시즌 감지(폴링의 본체) ──
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      new_spids: ${{ steps.sync.outputs.new_spids }}
+      new_seasons: ${{ steps.sync.outputs.new_seasons }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Sync meta (spid/season)
+        id: sync
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          META_MODE: sync
+          META_LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: python meta_crawler.py
+
+  # ── 2) crawl: 신규 감지된 시각에만, crawled=FALSE 인 spid 만 크롤(경량 단일 잡) ──
+  crawl:
+    needs: sync
+    if: >-
+      needs.sync.outputs.new_spids != '0' ||
+      needs.sync.outputs.new_seasons != '0' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Crawl new players
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          META_MODE: crawl
+          # dispatch(스모크)는 신규가 없어도 돌 수 있게 ONLY_NEW 를 끄고 limit 으로 제한
+          META_ONLY_NEW: ${{ github.event_name == 'workflow_dispatch' && '0' || '1' }}
+          META_LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: python meta_crawler.py
+
+  # ── 3) notify: crawl 이 실제로 돈 실행에서만 카카오톡 요약 1통 ──
+  notify:
+    needs: crawl
+    if: always() && needs.crawl.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Send summary
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          EXPECTED_SHARDS: "1"
+          NOTIFY_LABEL: "목요일 신규"
+          KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          # 이메일 폴백(선택). 없으면 카톡 실패 시 로그만 남긴다.
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+        run: python notify.py

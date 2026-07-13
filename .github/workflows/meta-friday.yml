@@ -1,0 +1,107 @@
+name: meta-friday
+
+# 라이브 퍼포먼스(기존 카드 능력치 변동)는 **금요일 11:00 KST** 에 반영된다.
+# 직후(11:20 KST, GitHub cron 지연 감안) 전체 ~8.8만 선수를 재크롤해 콘텐츠 해시가
+# 바뀐 카드만 UPDATE 한다. 목요일 패치가 기존 카드를 건드린 변경(신규 특성 부여,
+# 포지션 추가 등)도 여기서 함께 잡힌다 — 목요일 폴링(meta-thursday.yml)은 신규
+# 카드만 크롤하기 때문. 즉 이 워크플로가 주간 안전망을 겸한다.
+#
+# ⚠️ 이 워크플로의 샤딩은 시세 크롤러(crawl.yml)와 정반대다.
+#    시세 = 6토막 "시간분산 sequential(동시 1, 버스트 회피)".
+#    이것 = crawl 단계 4샤드 "병렬 matrix(주 1회라 같은 낮에 빨리 끝내려는 의도적 burst)".
+#
+# 단계: sync(신규 spid/시즌 upsert, 1회) → crawl(4샤드 병렬 풀크롤) → notify(카톡 요약).
+# 세 단계 모두 META_RUN_ID = github.run_id 로 묶여 meta_crawl_log 에서 집계된다.
+
+on:
+  schedule:
+    - cron: "20 2 * * 5"   # 금 02:20 UTC = 금 11:20 KST (라이브 퍼포먼스 반영 직후)
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "테스트용 spid 수 상한 (0=전체)"
+        required: false
+        default: "0"
+
+# 🔒 시크릿(DB·카카오·SMTP)은 코드에 두지 않는다. pull_request 트리거 금지(시크릿 노출 방지).
+permissions:
+  contents: read
+
+concurrency:
+  group: meta-friday
+  cancel-in-progress: false
+
+env:
+  META_RUN_ID: ${{ github.run_id }}
+
+jobs:
+  # ── 1) sync: spid.json/seasonid.json upsert (금요일에도 이름 변경/추가분 반영) ──
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Sync meta (spid/season)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          META_MODE: sync
+          META_LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: python meta_crawler.py
+
+  # ── 2) crawl: 전체 선수를 4샤드 병렬 재크롤. 해시 바뀐 카드만 write ──
+  crawl:
+    needs: sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 180   # DB 왕복 배치화 후 샤드당 ~30분 예상, 여유 상한
+    strategy:
+      fail-fast: false      # 한 샤드가 죽어도 나머지는 계속(notify 가 실패 샤드를 보고)
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Crawl shard ${{ matrix.shard }}/4
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          META_MODE: crawl
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_COUNT: "4"
+          META_LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: python meta_crawler.py
+
+  # ── 3) notify: meta_crawl_log 를 run_id 로 모아 카카오톡 요약 1통 ──
+  notify:
+    needs: crawl
+    if: always()           # 일부 샤드 실패해도 요약은 보낸다
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Send summary
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          EXPECTED_SHARDS: "4"
+          NOTIFY_LABEL: "금요일 라이브"
+          KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          # 이메일 폴백(선택). 없으면 카톡 실패 시 로그만 남긴다.
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+        run: python notify.py
