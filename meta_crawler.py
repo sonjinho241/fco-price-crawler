@@ -499,19 +499,20 @@ def read_target_spids(conn, only_new: bool) -> List[int]:
 
 
 # 카드마다 SELECT 1회(왕복 ~150ms)를 없애기 위해, 샤드가 맡은 spid 들의
-# (id, content_hash) 를 시작 시 한 번에 메모리로 프리로드한다.
+# (id, content_hash, main_ovr) 를 시작 시 한 번에 메모리로 프리로드한다.
+# main_ovr 은 변경 카드의 OVR 변동량(delta = 새 OVR − 옛 OVR) 계산에 쓴다.
 _EXISTING_SQL = text(f"""
-    SELECT spid, id, content_hash FROM {PLAYER_SCHEMA}.players
+    SELECT spid, id, content_hash, main_ovr FROM {PLAYER_SCHEMA}.players
     WHERE spid = ANY(CAST(:spids AS bigint[]))
 """)
 
 
-def _load_existing(conn, spids: List[int]) -> Dict[int, Tuple[int, Optional[str]]]:
-    existing: Dict[int, Tuple[int, Optional[str]]] = {}
+def _load_existing(conn, spids: List[int]) -> Dict[int, Tuple[int, Optional[str], Optional[int]]]:
+    existing: Dict[int, Tuple[int, Optional[str], Optional[int]]] = {}
     for i in range(0, len(spids), _SYNC_CHUNK):
         chunk = spids[i:i + _SYNC_CHUNK]
         for r in conn.execute(_EXISTING_SQL, {"spids": _pg_array_literal(chunk)}).all():
-            existing[r.spid] = (r.id, r.content_hash)
+            existing[r.spid] = (r.id, r.content_hash, r.main_ovr)
     return existing
 
 
@@ -551,7 +552,7 @@ def _bind_expr(col: str) -> str:
 
 def _upsert_player(conn, spid: int, parsed: dict, season_id: int, nation_id: int,
                    trait_ids: List[int], team_color_ids: List[int], chash: str,
-                   existing_id: Optional[int]) -> None:
+                   existing_id: Optional[int], ovr_change: Optional[int] = None) -> None:
     base = {
         "spid": spid,
         "name": parsed["name"],
@@ -585,6 +586,12 @@ def _upsert_player(conn, spid: int, parsed: dict, season_id: int, nation_id: int
     else:
         set_sql = ", ".join(f"{c} = {_bind_expr(c)}" for c in base) + ", updated_at = now()"
         params = dict(base, _id=existing_id)
+        # OVR 이 실제로 바뀐 카드에만 변동량+시각을 기록한다(delta==0 이면 두 컬럼 미변경 →
+        # 해시만 바뀐 재기록에 거짓 인디케이터가 안 생김). 쿼리 텍스트는 with/without 두
+        # 형태로만 갈라져(길이 가변 아님) pg_stat_statements 비대 우려 없음.
+        if ovr_change is not None and ovr_change != 0:
+            set_sql += ", ovr_change = :ovr_change, ovr_changed_at = now()"
+            params["ovr_change"] = ovr_change
         conn.execute(
             text(f"UPDATE {PLAYER_SCHEMA}.players SET {set_sql} WHERE id = :_id"),
             params,
@@ -685,8 +692,13 @@ def crawl_shard(engine, run_id: str) -> None:
                         new_players += 1
                         engine_conn.commit()   # 변경 카드만 개별 커밋(실패 격리)
                     elif existing[1] != chash:
+                        # 라이브 퍼포먼스로 바뀐 카드 → 새 OVR − 옛 OVR = delta(선수 디테일
+                        # ▲/▼ 인디케이터용). 옛 OVR 이 없으면(있을 리 없지만) 0 취급.
+                        old_ovr = existing[2]
+                        delta = (parsed["main_position"]["ovr"] - old_ovr) if old_ovr is not None else 0
                         _upsert_player(engine_conn, spid, parsed, season_id, nation_id,
-                                       trait_ids, team_color_ids, chash, existing[0])
+                                       trait_ids, team_color_ids, chash, existing[0],
+                                       ovr_change=delta)
                         changed += 1
                         engine_conn.commit()
                     # 같으면 write 스킵(커밋할 것도 없음)
