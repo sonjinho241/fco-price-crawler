@@ -49,6 +49,7 @@ from sqlalchemy import (
     create_engine,
     text,
 )
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.sql import func
 
 logger = logging.getLogger("price_latest_crawler")
@@ -153,8 +154,11 @@ def make_engine():
     url = url.replace("postgres://", "postgresql://", 1)
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    # pool_pre_ping: 유휴 커넥션이 끊겨도 재연결.
-    return create_engine(url, pool_pre_ping=True)
+    # pool_pre_ping: 체크아웃할 때마다 죽은 커넥션을 걸러낸다. 단 이건 커넥션을
+    # 풀에서 "꺼낼 때"만 도므로, 커넥션 하나를 붙들고 있으면 아무 일도 하지 않는다
+    # (2026-07-16 실패 원인). 쓰기는 반드시 flush 마다 새로 체크아웃해야 한다.
+    # pool_recycle: 풀러가 조용히 끊는 시간보다 먼저 우리가 커넥션을 버린다.
+    return create_engine(url, pool_pre_ping=True, pool_recycle=600)
 
 
 def read_spids(conn) -> List[int]:
@@ -207,7 +211,10 @@ def _pg_array_literal(values) -> str:
     return "{" + ",".join(parts) + "}"
 
 
-def bulk_upsert_latest(conn, rows: List[dict]) -> int:
+_DB_MAX_RETRIES = 4
+
+
+def bulk_upsert_latest(engine, rows: List[dict]) -> int:
     """최신 시세들을 player_price_latest 에 한 번에 upsert. 멱등. 반환=시도 행 수.
 
     price 가 기존 값과 같으면 ON CONFLICT 시 UPDATE 를 건너뛴다
@@ -216,20 +223,43 @@ def bulk_upsert_latest(conn, rows: List[dict]) -> int:
     Disk IO 예산을 갉아먹는다(이 크롤러가 하루 6번 도므로 누적이 크다). 그래서
     값이 실제로 변한 행만 쓴다. 이 때문에 updated_at 의 의미는 "마지막 확인 시각"이
     아니라 "마지막으로 price 가 바뀐 시각"이 된다.
+
+    ⚠️ 커넥션은 호출마다 새로 체크아웃한다(엔진을 받는 이유). 이 배치는 한 샤드가
+    한 시간 넘게 도는데, 그동안 커넥션 하나를 붙들고 있으면 flush 사이 ~95초씩
+    유휴 상태가 된다. Supabase 트랜잭션 모드 풀러(:6543)는 그런 커넥션을 조용히
+    닫고, 다음 쓰기가 "SSL connection has been closed unexpectedly" 로 죽는다
+    (2026-07-16 shard 4/6, 73% 지점에서 실패). 매번 체크아웃해야 pool_pre_ping 이
+    죽은 커넥션을 걸러낼 기회를 갖는다.
+
+    그래도 뚫고 들어오는 끊김(체크아웃 직후 닫히는 경우)에 대비해 재시도한다.
+    upsert 가 멱등이므로 같은 버퍼를 다시 써도 안전하다.
     """
     if not rows:
         return 0
-    conn.execute(
-        _UPSERT_LATEST_SQL,
-        {
-            "spids": _pg_array_literal(r["spid"] for r in rows),
-            "strongs": _pg_array_literal(r["strong"] for r in rows),
-            "prices": _pg_array_literal(r["price"] for r in rows),
-            "price_dates": _pg_array_literal(r["price_date"] for r in rows),
-        },
-    )
-    conn.commit()
-    return len(rows)
+    params = {
+        "spids": _pg_array_literal(r["spid"] for r in rows),
+        "strongs": _pg_array_literal(r["strong"] for r in rows),
+        "prices": _pg_array_literal(r["price"] for r in rows),
+        "price_dates": _pg_array_literal(r["price_date"] for r in rows),
+    }
+    for attempt in range(_DB_MAX_RETRIES):
+        try:
+            with engine.connect() as conn:
+                conn.execute(_UPSERT_LATEST_SQL, params)
+                conn.commit()
+            return len(rows)
+        except OperationalError as exc:
+            if attempt == _DB_MAX_RETRIES - 1:
+                raise
+            # 끊긴 커넥션이 풀에 남아 다음 시도까지 오염시키지 않게 통째로 버린다.
+            engine.dispose()
+            wait = 2.0 * (attempt + 1)
+            logger.warning(
+                "DB 쓰기 실패(%d/%d), %.1fs 후 재시도: %s",
+                attempt + 1, _DB_MAX_RETRIES, wait, exc.orig or exc,
+            )
+            time.sleep(wait)
+    raise AssertionError("unreachable")  # 루프는 항상 return 또는 raise 로 끝난다
 
 
 def vacuum_analyze(engine) -> None:
@@ -337,53 +367,56 @@ def run() -> None:
     session.mount("http://", adapter)
 
     engine = make_engine()
+
+    # spid 목록만 읽고 커넥션을 바로 돌려준다. 이후 쓰기는 flush 마다 새로 체크아웃한다
+    # (bulk_upsert_latest 주석 참고).
     with engine.connect() as conn:
         all_spids = read_spids(conn)
-        if spid_limit > 0:                       # 테스트용 상한은 샤딩 전에 적용
-            all_spids = all_spids[:spid_limit]
-        spids = _shard(all_spids)
+    if spid_limit > 0:                       # 테스트용 상한은 샤딩 전에 적용
+        all_spids = all_spids[:spid_limit]
+    spids = _shard(all_spids)
 
-        tasks = [(spid, strong) for spid in spids for strong in strongs]
-        total = len(tasks)
-        logger.info(
-            "배치 시작: spids=%d × strongs=%s → tasks=%d (workers=%d, delay=%.3fs)",
-            len(spids), strongs, total, workers, delay,
-        )
+    tasks = [(spid, strong) for spid in spids for strong in strongs]
+    total = len(tasks)
+    logger.info(
+        "배치 시작: spids=%d × strongs=%s → tasks=%d (workers=%d, delay=%.3fs)",
+        len(spids), strongs, total, workers, delay,
+    )
 
-        done = 0
-        written = 0
-        started = time.monotonic()
+    done = 0
+    written = 0
+    started = time.monotonic()
 
-        # 작업을 청크 단위로 처리해 미해결 future 수(=메모리)를 상한선 안에 둔다.
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            for chunk in _chunked(tasks, chunk_size):
-                futures = [
-                    executor.submit(_fetch_one, session, spid, strong, max_retries, delay)
-                    for spid, strong in chunk
-                ]
-                buffer: List[dict] = []
-                for future in as_completed(futures):
-                    done += 1
-                    row = future.result()
-                    if row is not None:
-                        buffer.append(row)
-                        if len(buffer) >= db_batch:
-                            written += bulk_upsert_latest(conn, buffer)
-                            buffer = []
-                if buffer:
-                    written += bulk_upsert_latest(conn, buffer)
+    # 작업을 청크 단위로 처리해 미해결 future 수(=메모리)를 상한선 안에 둔다.
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for chunk in _chunked(tasks, chunk_size):
+            futures = [
+                executor.submit(_fetch_one, session, spid, strong, max_retries, delay)
+                for spid, strong in chunk
+            ]
+            buffer: List[dict] = []
+            for future in as_completed(futures):
+                done += 1
+                row = future.result()
+                if row is not None:
+                    buffer.append(row)
+                    if len(buffer) >= db_batch:
+                        written += bulk_upsert_latest(engine, buffer)
+                        buffer = []
+            if buffer:
+                written += bulk_upsert_latest(engine, buffer)
 
-                elapsed = time.monotonic() - started
-                rate = done / elapsed if elapsed else 0
-                logger.info(
-                    "진행 %d/%d (%.1f%%) written=%d %.1f req/s",
-                    done, total, 100 * done / total if total else 100, written, rate,
-                )
+            elapsed = time.monotonic() - started
+            rate = done / elapsed if elapsed else 0
+            logger.info(
+                "진행 %d/%d (%.1f%%) written=%d %.1f req/s",
+                done, total, 100 * done / total if total else 100, written, rate,
+            )
 
-        logger.info(
-            "배치 완료: tasks=%d written=%d elapsed=%.0fs",
-            total, written, time.monotonic() - started,
-        )
+    logger.info(
+        "배치 완료: tasks=%d written=%d elapsed=%.0fs",
+        total, written, time.monotonic() - started,
+    )
 
     # 이번 샤드가 실제로 뭔가 썼을 때만 청소한다(안 바뀐 날 = dead 없음 = VACUUM 불필요).
     if written:
