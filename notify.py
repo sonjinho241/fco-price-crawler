@@ -11,6 +11,7 @@ run_id 로 모아 집계한다.
     DATABASE_URL          (필수) Postgres 접속 문자열
     META_RUN_ID           (필수) 이 실행 ID. meta_crawl_log 집계 키
     EXPECTED_SHARDS       crawl 샤드 수(기본 4). 로그된 샤드가 이보다 적으면 "샤드 누락" 경고
+    NOTIFY_TOP_N          신규 선수 미리보기 인원(기본 5, 0=미리보기 끔)
     KAKAO_REST_KEY        카카오 디벨로퍼스 REST API 키
     KAKAO_REFRESH_TOKEN   카카오 OAuth refresh token(1회 발급해 Secret 저장)
     SMTP_HOST/PORT/USER/PASS, NOTIFY_EMAIL_TO   (선택) 카톡 실패 시 이메일 폴백
@@ -28,6 +29,8 @@ from email.mime.text import MIMEText
 import requests
 from sqlalchemy import create_engine, text
 
+from meta_crawler import _pg_array_literal
+
 KAUTH_TOKEN_URL = "https://kauth.kakao.com/oauth/token"
 KAKAO_MEMO_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
 
@@ -38,6 +41,49 @@ def make_engine():
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return create_engine(url, pool_pre_ping=True)
+
+
+# 신규 spid 를 players/seasonid 와 조인해 상위 N명만 뽑는다(알림 미리보기용).
+# ⚠️ spid 배열은 _pg_array_literal() 문자열 1개로 바인드한다 — 파이썬 리스트 바인드는
+#    원소 수별로 pg_stat_statements 엔트리가 갈라진다(meta_crawler 의 같은 규칙).
+#
+# 정렬은 앱 검색 결과의 기본 정렬(main_ovr DESC, spid ASC)과 일부러 똑같이 맞춘다.
+# 백엔드 players/crud.py 의 normalize_search_sort() 기본값(sort_by='overall',
+# sort_order='desc') + tie-breaker asc(Player.spid) 와 대응 — 알림에서 본 순서와
+# 앱에서 본 순서가 어긋나지 않게 하기 위함이다. 저쪽을 바꾸면 여기도 같이 바꿀 것.
+# NULLS LAST 는 백엔드의 coalesce(main_ovr, -1) 와 같은 결과(내림차순에서 NULL 뒤로).
+# 성장형 시즌(예: 596 SH)은 전원 같은 OVR 이라 사실상 spid 순으로 나온다.
+_TOP_NEW_SQL = text("""
+    SELECT p.name, s.class_name
+    FROM player.players p
+    LEFT JOIN player.seasonid s ON s.season_id = p.season_id
+    WHERE p.spid = ANY(CAST(:spids AS bigint[]))
+    ORDER BY p.main_ovr DESC NULLS LAST, p.spid ASC
+    LIMIT :lim
+""")
+
+
+def _season_abbrev(class_name: str) -> str:
+    """'SH (Step Higher)' → 'SH'. class_name 은 전부 '약칭 (English Full Name)' 꼴이다.
+
+    ⚠️ **마지막** 괄호에서 자른다. 첫 괄호로 자르면 시즌 110 'ICON TM(제한) (ICON The
+    Moment Bound)' 이 'ICON TM' 이 돼 시즌 100 'ICON TM (ICON The Moment)' 과 구별이
+    안 된다. 마지막 괄호 기준이면 149개 시즌 약칭이 전부 고유하다(2026-07 전수 확인).
+    """
+    if not class_name:
+        return ""
+    return class_name.rsplit("(", 1)[0].strip() or class_name.strip()
+
+
+def _top_new_players(engine, spids: list, limit: int) -> list:
+    """crawl 이 방금 넣은 신규 카드 중 상위 limit 명. [(시즌약칭, 이름), ...]"""
+    if not spids or limit <= 0:
+        return []
+    with engine.connect() as c:
+        rows = c.execute(
+            _TOP_NEW_SQL, {"spids": _pg_array_literal(spids), "lim": limit}
+        ).all()
+    return [(_season_abbrev(r.class_name), r.name) for r in rows]
 
 
 def aggregate(engine, run_id: str) -> dict:
@@ -57,7 +103,7 @@ def aggregate(engine, run_id: str) -> dict:
     crawl_shards = set()
     new_traits = {}     # id -> name (중복 제거)
     new_seasons = []
-    new_spid_count = 0
+    new_spids = []
 
     for r in rows:
         if r["phase"] == "crawl":
@@ -71,17 +117,22 @@ def aggregate(engine, run_id: str) -> dict:
         elif r["phase"] == "sync":
             for s in (r["new_seasons"] or []):
                 new_seasons.append(s)
-            new_spid_count += len(r["new_spids"] or [])
+            new_spids.extend(r["new_spids"] or [])
 
     expected = int(os.getenv("EXPECTED_SHARDS", "4"))
+    # sync 가 신규로 잡은 spid 를 crawl 이 채운 뒤라 이 시점엔 players 에서 읽을 수 있다.
+    # 크롤 실패분은 players 에 없어 조용히 빠진다(미리보기라 실패는 🔴 줄이 따로 알린다).
+    top_new = _top_new_players(engine, new_spids, int(os.getenv("NOTIFY_TOP_N", "5")))
+
     return {
         "run_id": run_id,
         "new_players": new_players,
-        "new_spid_count": new_spid_count,
+        "new_spid_count": len(new_spids),
         "changed": changed,
         "failures": failures,
         "new_traits": new_traits,
         "new_seasons": new_seasons,
+        "top_new": top_new,
         "shards_logged": len(crawl_shards),
         "shards_expected": expected,
         "missing_shards": expected - len(crawl_shards),
@@ -109,6 +160,14 @@ def build_message(s: dict) -> str:
     if s["new_seasons"]:
         names = ", ".join(x.get("class_name", "?") for x in s["new_seasons"][:3])
         lines.append(f"• 시즌: {names}")
+
+    # 신규 선수 미리보기는 맨 끝 — 200자를 넘겨 잘리더라도 위의 경고/집계는 살아남는다.
+    if s["top_new"]:
+        preview = ", ".join(
+            f"{abbrev} {name}".strip() for abbrev, name in s["top_new"]
+        )
+        more = s["new_spid_count"] - len(s["top_new"])
+        lines.append(f"• 신규: {preview}" + (f" 외 {more}명" if more > 0 else ""))
 
     if (s["new_players"] == 0 and s["changed"] == 0 and not s["new_traits"]
             and not s["new_seasons"] and s["failures"] == 0 and s["missing_shards"] == 0):
