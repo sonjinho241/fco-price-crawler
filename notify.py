@@ -25,6 +25,7 @@ import re
 import smtplib
 import sys
 from email.mime.text import MIMEText
+from typing import Optional
 
 import requests
 from sqlalchemy import create_engine, text
@@ -86,6 +87,51 @@ def _top_new_players(engine, spids: list, limit: int) -> list:
     return [(_season_abbrev(r.class_name), r.name) for r in rows]
 
 
+# ── 변동 카드 미리보기 ────────────────────────────────────────────────────────
+# meta_crawl_log 는 변동 "개수"만 남기고 어떤 카드가 바뀌었는지는 안 남긴다
+# (신규는 sync 가 new_spids 를 남겨서 알 수 있지만 변동은 대응물이 없다).
+# 그래서 시각으로 역산한다: 이 run 의 첫 로그(=sync 트랜잭션 시작) 이후에 updated_at
+# 이 갱신됐고, 그 전에 이미 존재했던(created_at < since) 카드 = 이번에 바뀐 카드.
+# meta_crawler._upsert_player 가 INSERT/UPDATE 양쪽에서 updated_at=now() 를 찍고,
+# 해시가 같으면 아예 write 를 건너뛰므로 이 조건이 changed 집합과 정확히 일치한다.
+# 신규 카드는 created_at >= since 라 자동으로 빠진다.
+#
+# ⚠️ players.created_at/updated_at 은 timestamp WITHOUT tz(naive UTC 로 적재)인데
+#    meta_crawl_log.created_at 은 timestamptz 다. 세션 타임존에 의존하지 않도록
+#    AT TIME ZONE 'UTC' 로 명시 변환해서 비교한다.
+# ⚠️ 이 방식은 crawl 중 players 를 건드리는 다른 writer 가 없다는 전제에 기댄다.
+#    (시세 크롤러는 player_price_latest 만 쓴다. 이 전제가 깨지면 changed_spids 를
+#     meta_crawl_log 에 명시적으로 남기는 쪽으로 바꿔야 한다.)
+_RUN_SINCE_SQL = text("""
+    SELECT min(created_at) AT TIME ZONE 'UTC'
+    FROM player.meta_crawl_log
+    WHERE run_id = :rid
+""")
+
+_CHANGED_PREVIEW_SQL = text("""
+    SELECT p.name, s.class_name
+    FROM player.players p
+    LEFT JOIN player.seasonid s ON s.season_id = p.season_id
+    WHERE p.updated_at >= :since AND p.created_at < :since
+    ORDER BY p.main_ovr DESC NULLS LAST, p.spid ASC
+    LIMIT :lim
+""")
+
+
+def _top_changed_players(engine, run_id: str, limit: int) -> list:
+    """이번 run 에서 내용이 바뀐 카드 중 상위 limit 명. [(시즌약칭, 이름), ...]"""
+    if limit <= 0:
+        return []
+    with engine.connect() as c:
+        since = c.execute(_RUN_SINCE_SQL, {"rid": run_id}).scalar()
+        if since is None:
+            return []
+        rows = c.execute(
+            _CHANGED_PREVIEW_SQL, {"since": since, "lim": limit}
+        ).all()
+    return [(_season_abbrev(r.class_name), r.name) for r in rows]
+
+
 def aggregate(engine, run_id: str) -> dict:
     """meta_crawl_log 를 run_id 로 모아 요약 dict 를 만든다."""
     with engine.connect() as c:
@@ -120,9 +166,11 @@ def aggregate(engine, run_id: str) -> dict:
             new_spids.extend(r["new_spids"] or [])
 
     expected = int(os.getenv("EXPECTED_SHARDS", "4"))
+    top_n = int(os.getenv("NOTIFY_TOP_N", "5"))
     # sync 가 신규로 잡은 spid 를 crawl 이 채운 뒤라 이 시점엔 players 에서 읽을 수 있다.
     # 크롤 실패분은 players 에 없어 조용히 빠진다(미리보기라 실패는 🔴 줄이 따로 알린다).
-    top_new = _top_new_players(engine, new_spids, int(os.getenv("NOTIFY_TOP_N", "5")))
+    top_new = _top_new_players(engine, new_spids, top_n)
+    top_changed = _top_changed_players(engine, run_id, top_n) if changed else []
 
     return {
         "run_id": run_id,
@@ -133,14 +181,25 @@ def aggregate(engine, run_id: str) -> dict:
         "new_traits": new_traits,
         "new_seasons": new_seasons,
         "top_new": top_new,
+        "top_changed": top_changed,
         "shards_logged": len(crawl_shards),
         "shards_expected": expected,
         "missing_shards": expected - len(crawl_shards),
     }
 
 
-def build_message(s: dict) -> str:
-    """카카오 text 템플릿용 요약(200자 제한 고려, 넘으면 잘라낸다)."""
+def _card_preview(cards: list, total: int, unit: str = "명") -> str:
+    """[(시즌약칭, 이름), ...] → 'SH 크리스티아누 호날두, SH 리오넬 메시 외 32명'"""
+    body = ", ".join(f"{abbrev} {name}".strip() for abbrev, name in cards)
+    more = total - len(cards)
+    return body + (f" 외 {more}{unit}" if more > 0 else "")
+
+
+def build_message(s: dict, max_len: Optional[int] = None) -> str:
+    """요약 텍스트. max_len 을 주면 그 길이로 잘라낸다(카카오 text 템플릿 200자 제한용).
+
+    이메일 폴백은 길이 제한이 없으므로 max_len 없이 호출해 전문을 보낸다.
+    """
     short_run = str(s["run_id"])[-6:]
     label = os.getenv("NOTIFY_LABEL", "메타 크롤")   # 워크플로가 요일별 라벨 주입
     lines = [f"[FCO {label} #{short_run}]"]
@@ -154,27 +213,31 @@ def build_message(s: dict) -> str:
     lines.append(f"🟢 신규선수 {s['new_players']}  🔵 변동 {s['changed']}장")
     lines.append(f"🟡 신규특성 {len(s['new_traits'])}  🟣 신규시즌 {len(s['new_seasons'])}")
 
+    # 미리보기는 집계 아래로 — 길이 초과로 잘려도 위의 경고/집계는 살아남는다.
     if s["new_traits"]:
-        names = ", ".join(list(s["new_traits"].values())[:5])
-        lines.append(f"• 특성: {names}")
+        names = list(s["new_traits"].values())
+        shown = ", ".join(names[:5])
+        more = len(names) - 5
+        lines.append(f"• 특성: {shown}" + (f" 외 {more}개" if more > 0 else ""))
     if s["new_seasons"]:
-        names = ", ".join(x.get("class_name", "?") for x in s["new_seasons"][:3])
-        lines.append(f"• 시즌: {names}")
+        names = [x.get("class_name", "?") for x in s["new_seasons"]]
+        shown = ", ".join(names[:3])
+        more = len(names) - 3
+        lines.append(f"• 시즌: {shown}" + (f" 외 {more}개" if more > 0 else ""))
 
-    # 신규 선수 미리보기는 맨 끝 — 200자를 넘겨 잘리더라도 위의 경고/집계는 살아남는다.
     if s["top_new"]:
-        preview = ", ".join(
-            f"{abbrev} {name}".strip() for abbrev, name in s["top_new"]
-        )
-        more = s["new_spid_count"] - len(s["top_new"])
-        lines.append(f"• 신규: {preview}" + (f" 외 {more}명" if more > 0 else ""))
+        lines.append("• 신규: " + _card_preview(s["top_new"], s["new_spid_count"]))
+    if s["top_changed"]:
+        lines.append("• 변동: " + _card_preview(s["top_changed"], s["changed"], unit="장"))
 
     if (s["new_players"] == 0 and s["changed"] == 0 and not s["new_traits"]
             and not s["new_seasons"] and s["failures"] == 0 and s["missing_shards"] == 0):
         lines.append("변동 없음 (정상 동작)")
 
     msg = "\n".join(lines)
-    return msg[:195] + "…" if len(msg) > 196 else msg
+    if max_len is not None and len(msg) > max_len:
+        return msg[:max_len - 1] + "…"
+    return msg
 
 
 def run_link() -> str:
@@ -247,18 +310,20 @@ def main() -> None:
     run_id = os.environ["META_RUN_ID"]
     engine = make_engine()
     summary = aggregate(engine, run_id)
-    message = build_message(summary)
     link = run_link()
-    print("요약:\n" + message)
+    # 카톡은 text 템플릿 200자 제한이 있어 잘라 보내고, 이메일은 제한이 없어 전문을 보낸다.
+    full_message = build_message(summary)
+    kakao_message = build_message(summary, max_len=196)
+    print("요약:\n" + full_message)
 
     # 카톡 우선, 실패하면 이메일 폴백. 둘 다 실패해도 잡은 죽이지 않는다(요약은 로그에 있음).
     try:
-        send_kakao(message, link)
+        send_kakao(kakao_message, link)
         return
     except Exception as exc:
         print(f"카카오톡 전송 실패: {exc}")
     try:
-        send_email(message, link)
+        send_email(full_message, link)
     except Exception as exc:
         print(f"이메일 폴백도 실패: {exc}", file=sys.stderr)
 
