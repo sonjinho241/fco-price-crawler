@@ -8,8 +8,9 @@ GitHub Actions 에서 두 워크플로가 이 스크립트를 돌린다:
 선수 카드 내용을 콘텐츠 해시로 떠서 **바뀐 카드만 DB write** 한다(안 바뀐 ~8.8만 장을
 매번 덮어쓰지 않음 → Disk IO/bloat 절감, 시세 크롤러의 no-op skip 과 같은 취지).
 
-크롤 도중 (1)처음 보는 spid = 신규 선수, (2)처음 보는 특성 = 신규 특성, (3)해시가
-바뀐 기존 선수 = 라이브 퍼포먼스 변동 을 감지해 player.meta_crawl_log 에 적는다.
+크롤 도중 (1)처음 보는 spid = 신규 선수, (2)처음 보는 특성 = 신규 특성, (3)처음 보는
+팀컬러 = 신규 팀컬러, (4)해시가 바뀐 기존 선수 = 라이브 퍼포먼스 변동 을 감지해
+player.meta_crawl_log 에 적는다.
 모든 샤드가 끝나면 notify 잡이 이 로그를 모아 카카오톡 요약 1통을 보낸다.
 
 ⚠️ 비밀정보(DATABASE_URL)는 절대 이 파일/저장소에 두지 않는다. GitHub Secret 으로만 주입.
@@ -61,6 +62,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 from bs4 import BeautifulSoup
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger("meta_crawler")
 
@@ -294,6 +296,9 @@ def _pg_array_literal(values) -> str:
 #      트랜잭션 advisory lock(이름 해시 기준)으로 같은 이름 생성만 직렬화한다.
 #   process 내에서는 캐시로 같은 이름을 두 번 조회하지 않는다.
 # =============================================================================
+_SEQ_CATCHUP_ATTEMPTS = 200
+
+
 class RefResolver:
     def __init__(self, engine):
         # ⚠️ 선수-쓰기 트랜잭션과 분리된 AUTOCOMMIT 커넥션. 레퍼런스 생성은 즉시 커밋되어,
@@ -314,23 +319,48 @@ class RefResolver:
         key = f"{lock_ns}:{name}"
         self.conn.execute(text("SELECT pg_advisory_lock(hashtext(:k))"), {"k": key})
         try:
+            new_id = self._select_or_insert(table, name, insert_cols)
+        finally:
+            self.conn.execute(text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": key})
+        cache[name] = new_id
+        return new_id
+
+    def _select_or_insert(self, table, name, insert_cols):
+        """SELECT 후 없으면 INSERT. pkey 중복이면 시퀀스가 따라잡을 때까지 재시도한다.
+
+        ⚠️ 레퍼런스 테이블 id 는 시퀀스 기본값인데, 외부 스크립트가 `max(id)+1` 로 직접
+           채번하고 setval 을 안 하면 시퀀스가 그만큼 뒤처진다. 그 상태로 여기가 INSERT 하면
+           nextval 이 이미 쓰인 id 를 돌려줘 pkey 중복으로 터지고, 레퍼런스 하나 때문에
+           그 선수 카드 저장 전체가 실패한다(2026-08-21 team_colors 44장).
+           실패한 INSERT 도 nextval 을 한 칸 진행시키므로 **그냥 재시도하면 따라잡는다.**
+           setval 로 한 번에 맞추지 않는 이유는 시퀀스 UPDATE 권한이 필요한데 크롤러 롤은
+           최소권한(USAGE)만 갖기 때문이다(sql/crawler_role.sql).
+        """
+        cols = ", ".join(insert_cols.keys())
+        binds = ", ".join(f":{k}" for k in insert_cols)
+        for attempt in range(_SEQ_CATCHUP_ATTEMPTS):
             row = self.conn.execute(
                 text(f"SELECT id FROM {PLAYER_SCHEMA}.{table} WHERE name = :name"),
                 {"name": name},
             ).first()
             if row:
-                new_id = row[0]
-            else:
-                cols = ", ".join(insert_cols.keys())
-                binds = ", ".join(f":{k}" for k in insert_cols)
-                new_id = self.conn.execute(
+                return row[0]
+            try:
+                return self.conn.execute(
                     text(f"INSERT INTO {PLAYER_SCHEMA}.{table} ({cols}) VALUES ({binds}) RETURNING id"),
                     insert_cols,
                 ).scalar()
-        finally:
-            self.conn.execute(text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": key})
-        cache[name] = new_id
-        return new_id
+            except IntegrityError:
+                if attempt == 0:
+                    logger.warning(
+                        "%s.id 시퀀스가 뒤처졌다(pkey 중복) — 재시도로 따라잡는 중. "
+                        "수동 채번 스크립트가 setval 을 빠뜨렸는지 확인할 것. name=%s",
+                        table, name,
+                    )
+        raise RuntimeError(
+            f"{PLAYER_SCHEMA}.{table} id 시퀀스가 {_SEQ_CATCHUP_ATTEMPTS}회 재시도로도 "
+            f"따라잡히지 않았다. setval 로 max(id) 에 맞춰야 한다(name={name})"
+        )
 
     def nation(self, name, image_url):
         return self._get_or_create(
@@ -652,11 +682,19 @@ def crawl_shard(engine, run_id: str) -> None:
                 text(f"SELECT id FROM {PLAYER_SCHEMA}.traits")
             ).all()
         }
+        # 팀컬러도 같은 방식으로 스냅샷을 떠서 신규를 감지한다(넥슨이 관계 팀컬러를
+        # 대량으로 추가하는 일이 있는데, 예전엔 알림에 아무 흔적도 남지 않았다).
+        known_team_color_ids = {
+            r[0] for r in engine_conn.execute(
+                text(f"SELECT id FROM {PLAYER_SCHEMA}.team_colors")
+            ).all()
+        }
 
         new_players = 0
         changed = 0
         failures = 0
         seen_new_traits: Dict[int, str] = {}
+        seen_new_team_colors: Dict[int, str] = {}
         done = 0
         started = time.monotonic()
         mark_buf: List[int] = []
@@ -709,6 +747,12 @@ def crawl_shard(engine, run_id: str) -> None:
                             seen_new_traits[tid] = t["name"]
                             known_trait_ids.add(tid)
 
+                    # 신규 팀컬러도 같은 방식으로.
+                    for cid, tc in zip(team_color_ids, parsed["team_colors"]):
+                        if cid not in known_team_color_ids:
+                            seen_new_team_colors[cid] = tc["name"]
+                            known_team_color_ids.add(cid)
+
                     mark_buf.append(spid)
                     if len(mark_buf) >= _MARK_CHUNK:
                         _flush_marks(engine_conn, mark_buf)
@@ -726,20 +770,27 @@ def crawl_shard(engine, run_id: str) -> None:
         _flush_marks(engine_conn, mark_buf)
         resolver.close()
         new_traits_payload = [{"id": tid, "name": nm} for tid, nm in seen_new_traits.items()]
+        new_team_colors_payload = [
+            {"id": cid, "name": nm} for cid, nm in seen_new_team_colors.items()
+        ]
         engine_conn.execute(
             text(f"""
                 INSERT INTO {PLAYER_SCHEMA}.meta_crawl_log
-                    (run_id, phase, shard, new_players, changed, failures, new_traits)
-                VALUES (:rid, 'crawl', :shard, :np, :ch, :fa, :nt)
+                    (run_id, phase, shard, new_players, changed, failures,
+                     new_traits, new_team_colors)
+                VALUES (:rid, 'crawl', :shard, :np, :ch, :fa,
+                        CAST(:nt AS jsonb), CAST(:ntc AS jsonb))
             """),
             {
                 "rid": run_id, "shard": index, "np": new_players, "ch": changed,
                 "fa": failures, "nt": json.dumps(new_traits_payload, ensure_ascii=False),
+                "ntc": json.dumps(new_team_colors_payload, ensure_ascii=False),
             },
         )
         engine_conn.commit()
-        logger.info("crawl 샤드 %d 완료: 신규=%d 변경=%d 신규특성=%d 실패=%d",
-                    index, new_players, changed, len(new_traits_payload), failures)
+        logger.info("crawl 샤드 %d 완료: 신규=%d 변경=%d 신규특성=%d 신규팀컬러=%d 실패=%d",
+                    index, new_players, changed, len(new_traits_payload),
+                    len(new_team_colors_payload), failures)
 
 
 # =============================================================================

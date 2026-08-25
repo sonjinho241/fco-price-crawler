@@ -138,7 +138,7 @@ def aggregate(engine, run_id: str) -> dict:
         rows = c.execute(
             text("""
                 SELECT phase, shard, new_players, changed, failures,
-                       new_traits, new_seasons, new_spids
+                       new_traits, new_team_colors, new_seasons, new_spids
                 FROM player.meta_crawl_log
                 WHERE run_id = :rid
             """),
@@ -147,7 +147,8 @@ def aggregate(engine, run_id: str) -> dict:
 
     new_players = changed = failures = 0
     crawl_shards = set()
-    new_traits = {}     # id -> name (중복 제거)
+    new_traits = {}       # id -> name (중복 제거)
+    new_team_colors = {}  # id -> name (샤드마다 겹칠 수 있어 id 로 합친다)
     new_seasons = []
     new_spids = []
 
@@ -160,6 +161,8 @@ def aggregate(engine, run_id: str) -> dict:
                 crawl_shards.add(r["shard"])
             for t in (r["new_traits"] or []):
                 new_traits[t["id"]] = t["name"]
+            for tc in (r["new_team_colors"] or []):
+                new_team_colors[tc["id"]] = tc["name"]
         elif r["phase"] == "sync":
             for s in (r["new_seasons"] or []):
                 new_seasons.append(s)
@@ -179,6 +182,7 @@ def aggregate(engine, run_id: str) -> dict:
         "changed": changed,
         "failures": failures,
         "new_traits": new_traits,
+        "new_team_colors": new_team_colors,
         "new_seasons": new_seasons,
         "top_new": top_new,
         "top_changed": top_changed,
@@ -211,7 +215,11 @@ def build_message(s: dict, max_len: Optional[int] = None) -> str:
         lines.append(f"🔴 크롤 실패 {s['failures']}건")
 
     lines.append(f"🟢 신규선수 {s['new_players']}  🔵 변동 {s['changed']}장")
-    lines.append(f"🟡 신규특성 {len(s['new_traits'])}  🟣 신규시즌 {len(s['new_seasons'])}")
+    # 팀컬러는 집계 줄에 얹는다(카카오 200자 제한 때문에 줄을 더 늘리지 않는다).
+    lines.append(
+        f"🟡 신규특성 {len(s['new_traits'])}  🟣 신규시즌 {len(s['new_seasons'])}"
+        f"  🟠 신규팀컬러 {len(s.get('new_team_colors') or {})}"
+    )
 
     # 미리보기는 집계 아래로 — 길이 초과로 잘려도 위의 경고/집계는 살아남는다.
     if s["new_traits"]:
@@ -219,6 +227,11 @@ def build_message(s: dict, max_len: Optional[int] = None) -> str:
         shown = ", ".join(names[:5])
         more = len(names) - 5
         lines.append(f"• 특성: {shown}" + (f" 외 {more}개" if more > 0 else ""))
+    if s.get("new_team_colors"):
+        names = list(s["new_team_colors"].values())
+        shown = ", ".join(names[:3])
+        more = len(names) - 3
+        lines.append(f"• 팀컬러: {shown}" + (f" 외 {more}개" if more > 0 else ""))
     if s["new_seasons"]:
         names = [x.get("class_name", "?") for x in s["new_seasons"]]
         shown = ", ".join(names[:3])
@@ -231,7 +244,8 @@ def build_message(s: dict, max_len: Optional[int] = None) -> str:
         lines.append("• 변동: " + _card_preview(s["top_changed"], s["changed"], unit="장"))
 
     if (s["new_players"] == 0 and s["changed"] == 0 and not s["new_traits"]
-            and not s["new_seasons"] and s["failures"] == 0 and s["missing_shards"] == 0):
+            and not s.get("new_team_colors") and not s["new_seasons"]
+            and s["failures"] == 0 and s["missing_shards"] == 0):
         lines.append("변동 없음 (정상 동작)")
 
     msg = "\n".join(lines)
