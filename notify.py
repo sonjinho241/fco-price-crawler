@@ -149,7 +149,8 @@ def aggregate(engine, run_id: str) -> dict:
     crawl_shards = set()
     new_traits = {}       # id -> name (중복 제거)
     new_team_colors = {}  # id -> name (샤드마다 겹칠 수 있어 id 로 합친다)
-    new_seasons = []
+    new_seasons = {}      # season_id -> dict (sync 행이 여러 개일 수 있어 id 로 합친다:
+                          # static 메타로 들어온 신규 시즌 + 데이터센터 시드 행)
     new_spids = []
 
     for r in rows:
@@ -165,7 +166,7 @@ def aggregate(engine, run_id: str) -> dict:
                 new_team_colors[tc["id"]] = tc["name"]
         elif r["phase"] == "sync":
             for s in (r["new_seasons"] or []):
-                new_seasons.append(s)
+                new_seasons.setdefault(s.get("season_id"), {}).update(s)
             new_spids.extend(r["new_spids"] or [])
 
     expected = int(os.getenv("EXPECTED_SHARDS", "4"))
@@ -183,7 +184,7 @@ def aggregate(engine, run_id: str) -> dict:
         "failures": failures,
         "new_traits": new_traits,
         "new_team_colors": new_team_colors,
-        "new_seasons": new_seasons,
+        "new_seasons": list(new_seasons.values()),
         "top_new": top_new,
         "top_changed": top_changed,
         "shards_logged": len(crawl_shards),
@@ -233,7 +234,14 @@ def build_message(s: dict, max_len: Optional[int] = None) -> str:
         more = len(names) - 3
         lines.append(f"• 팀컬러: {shown}" + (f" 외 {more}개" if more > 0 else ""))
     if s["new_seasons"]:
-        names = [x.get("class_name", "?") for x in s["new_seasons"]]
+        # 데이터센터 시드로 spid 를 채운 시즌은 표시해 둔다(출시 당일 폴백이 돌았다는 신호).
+        names = [
+            x.get("class_name", "?") + (
+                f"(시드 {x['seeded_from_datacenter']}장)"
+                if x.get("seeded_from_datacenter") else ""
+            )
+            for x in s["new_seasons"]
+        ]
         shown = ", ".join(names[:3])
         more = len(names) - 3
         lines.append(f"• 시즌: {shown}" + (f" 외 {more}개" if more > 0 else ""))

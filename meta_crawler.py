@@ -28,6 +28,17 @@ player.meta_crawl_log 에 적는다.
            META_ONLY_NEW=1 이면 crawled=FALSE 인 spid(=sync 가 방금 넣은 신규 +
            과거 크롤 실패분)만 크롤한다(목요일 폴링용 경량 모드).
 
+  seed-probe : DB 없이 데이터센터 PlayerList 시드 파서만 점검(META_SEED_SEASON=879).
+           페이지 1~2 의 spid 수와 앞 몇 개를 찍는다. 넥슨 마크업이 바뀌었는지 확인용.
+
+⚠️ 출시 당일의 반쪽 감지(2026-09-10 LKI2 에서 실제로 겪음):
+   넥슨 static 메타는 seasonid.json 이 먼저, spid.json 이 하루쯤 늦게 갱신된다. 그래서
+   목요일 sync 가 "신규 시즌"은 잡아도 그 시즌의 spid 가 0개라 crawl 이 할 일이 없고,
+   앱에는 선수 0명인 클래스 카드만 뜬 채 금요일 풀크롤까지 기다리게 됐다.
+   → sync 는 spid 가 하나도 없는 최근 시즌을 데이터센터 PlayerList(출시 즉시 노출)에서
+     긁어 crawled=FALSE 로 시드한다(_seed_spids_from_datacenter). 이름은 spid.json 이
+     갱신되면 기존 upsert 가 공식 값으로 덮어쓴다.
+
 ⚠️ 이 크롤러의 샤딩은 시세 크롤러(crawl.yml)와 정반대다. 시세는 "6토막 시간분산
    sequential(동시 1, 버스트 회피)"이고, 이건 "matrix 4샤드 병렬(주1회라 빨리 끝내려는
    의도적 burst)". 둘을 같은 방식이라 여기지 말 것.
@@ -42,6 +53,8 @@ player.meta_crawl_log 에 적는다.
     META_MAX_RETRIES        넥슨 호출 재시도 횟수 (기본 3)
     META_LIMIT              처리할 spid 수 상한 (기본 0=전체; 샤딩 전 적용, 테스트용)
     META_ONLY_NEW           '1' 이면 crawl 대상을 crawled=FALSE 인 spid 로 한정 (기본 0)
+    META_SEED_SEASON        seed-probe 모드에서 점검할 시즌 ID (예 879)
+    META_SEED_DISABLE       '1' 이면 sync 의 데이터센터 시드를 끈다 (기본 0)
 
 로컬 테스트:
     DATABASE_URL=postgresql://... META_MODE=sync python meta_crawler.py
@@ -71,6 +84,8 @@ PLAYER_SCHEMA = "player"
 PLAYER_URL = "https://open.api.nexon.com/static/fconline/meta/spid.json"
 SEASON_URL = "https://open.api.nexon.com/static/fconline/meta/seasonid.json"
 ABILITY_URL = "https://fconline.nexon.com/datacenter/PlayerAbility"
+DATACENTER_URL = "https://fconline.nexon.com/datacenter"
+PLAYER_LIST_URL = "https://fconline.nexon.com/datacenter/PlayerList"
 
 
 # =============================================================================
@@ -441,6 +456,161 @@ def _write_github_output(**kwargs) -> None:
             f.write(f"{k}={v}\n")
 
 
+# ── 데이터센터 PlayerList 시드(출시 당일 spid.json 지연 우회) ─────────────────
+# 시즌 필터는 strSeason 이고 값이 ",879," 처럼 앞뒤 콤마다(DataCenter.SetCheckSearch 가
+# 그렇게 만든다. "879" 만 보내면 0건). 페이지는 n4PageNo, 행 식별자는 area_playerunit_{spid}.
+_SEED_RECENT_SEASONS = 10        # 시드 대상은 seasonid 상위 N개 중 spid 0개인 시즌만(옛 빈 시즌 제외)
+_SEED_MAX_PAGES = 300            # 시즌 하나가 수백 장이라 페이지 상한(안전장치)
+_PLAYERUNIT_RE = re.compile(r"area_playerunit_(\d+)")
+
+# 시드 후보: 최근 시즌 중 player.spid 에 한 건도 없는 시즌. 8.8만 행 정수 나눗셈 1회라 가볍다.
+_SEASONS_WITHOUT_SPIDS_SQL = text(f"""
+    SELECT s.season_id, s.class_name
+    FROM (
+        SELECT season_id, class_name FROM {PLAYER_SCHEMA}.seasonid
+        ORDER BY season_id DESC LIMIT :recent
+    ) s
+    WHERE NOT EXISTS (
+        SELECT 1 FROM {PLAYER_SCHEMA}.spid p
+        WHERE p.spid / 1000000 = s.season_id
+    )
+    ORDER BY s.season_id DESC
+""")
+
+
+def fetch_player_list_page(session: requests.Session, season_id: int, page: int,
+                           timeout: int = 20) -> str:
+    res = session.post(
+        PLAYER_LIST_URL,
+        data={"strSeason": f",{season_id},", "n4PageNo": page},
+        headers={"Referer": DATACENTER_URL, "X-Requested-With": "XMLHttpRequest"},
+        timeout=timeout,
+    )
+    res.raise_for_status()
+    return res.text
+
+
+def parse_player_list(html: str, season_id: int) -> Dict[int, str]:
+    """PlayerList 한 페이지 → {spid: name}. 이름을 못 찾으면 ''(spid.json 이 나중에 채움).
+    다른 시즌 spid 가 섞여 오면(필터 무시·마크업 변경) 걸러 낸다."""
+    result: Dict[int, str] = {}
+    soup = BeautifulSoup(html, "html.parser")
+    for el in soup.find_all(id=_PLAYERUNIT_RE):
+        m = _PLAYERUNIT_RE.search(el.get("id", ""))
+        if not m:
+            continue
+        spid = int(m.group(1))
+        if spid // 1_000_000 != season_id:
+            continue
+        name_el = el.select_one(".name")
+        name = name_el.get_text(" ", strip=True) if name_el else ""
+        result[spid] = name
+    if not result:
+        # 마크업이 달라 id 매칭에 실패한 경우를 위한 정규식 폴백(이름 없이 spid 만).
+        for m in _PLAYERUNIT_RE.finditer(html):
+            spid = int(m.group(1))
+            if spid // 1_000_000 == season_id:
+                result.setdefault(spid, "")
+    return result
+
+
+def fetch_season_spids_from_datacenter(session: requests.Session, season_id: int) -> Dict[int, str]:
+    """시즌 하나의 spid 전부를 페이지 끝까지 긁는다. 새 spid 가 안 나오면 끝."""
+    found: Dict[int, str] = {}
+    for page in range(1, _SEED_MAX_PAGES + 1):
+        try:
+            html = fetch_player_list_page(session, season_id, page)
+        except requests.RequestException as exc:
+            logger.warning("시드 시즌=%s 페이지=%d 실패: %s", season_id, page, exc)
+            break
+        page_items = parse_player_list(html, season_id)
+        before = len(found)
+        found.update(page_items)
+        if not page_items or len(found) == before:
+            break
+        time.sleep(0.3)
+    return found
+
+
+def _seed_spids_from_datacenter(engine, session: requests.Session, run_id: str) -> List[int]:
+    """spid 가 0개인 최근 시즌을 데이터센터에서 긁어 crawled=FALSE 로 upsert. 신규 spid 목록 반환.
+
+    DB 커넥션은 (1)후보 조회, (2)시즌별 upsert 에서만 짧게 잡는다. 페이지 수백 장을 받는
+    HTTP 구간에는 커넥션을 들고 있지 않는다(idle in transaction 회피).
+    결과는 phase='sync' 로그 행으로 따로 남긴다 — notify 가 sync 행들을 합산하므로
+    시드분이 카톡 요약의 신규 spid/시즌에 그대로 반영된다.
+    """
+    with engine.begin() as conn:
+        candidates = conn.execute(
+            _SEASONS_WITHOUT_SPIDS_SQL, {"recent": _SEED_RECENT_SEASONS}
+        ).all()
+
+    all_inserted: List[int] = []
+    seeded_seasons: List[dict] = []
+    for season_id, class_name in candidates:
+        items = fetch_season_spids_from_datacenter(session, season_id)   # 커넥션 없이
+        if not items:
+            logger.info("시드 시즌=%s(%s): 데이터센터에도 아직 0건", season_id, class_name)
+            continue
+        spids = sorted(items)
+        inserted: List[int] = []
+        with engine.begin() as conn:
+            for i in range(0, len(spids), _SYNC_CHUNK):
+                chunk = spids[i:i + _SYNC_CHUNK]
+                res = conn.execute(
+                    _SPID_UPSERT_SQL,
+                    {
+                        "spids": _pg_array_literal(chunk),
+                        "names": _pg_array_literal(items[sp] for sp in chunk),
+                    },
+                ).all()
+                inserted.extend(r.spid for r in res if r.inserted)
+        logger.info("시드 시즌=%s(%s): 데이터센터 %d건 → 신규 spid %d건",
+                    season_id, class_name, len(spids), len(inserted))
+        if inserted:
+            all_inserted.extend(inserted)
+            seeded_seasons.append({
+                "season_id": season_id,
+                "class_name": class_name,
+                "seeded_from_datacenter": len(inserted),
+            })
+
+    if all_inserted:
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"""
+                    INSERT INTO {PLAYER_SCHEMA}.meta_crawl_log
+                        (run_id, phase, new_players, new_seasons, new_spids)
+                    VALUES (:rid, 'sync', :np, :ns, :nsp)
+                """),
+                {
+                    "rid": run_id,
+                    "np": len(all_inserted),
+                    "ns": json.dumps(seeded_seasons, ensure_ascii=False),
+                    "nsp": json.dumps(all_inserted),
+                },
+            )
+    return all_inserted
+
+
+def seed_probe() -> None:
+    """DB 없이 파서만 점검: META_SEED_SEASON 시즌의 1~2페이지를 받아 spid 수를 찍는다."""
+    season_id = _env_int("META_SEED_SEASON", 0)
+    if season_id <= 0:
+        raise SystemExit("META_SEED_SEASON=<시즌ID> 를 지정해주세요 (예 879)")
+    session = make_session()
+    total: Dict[int, str] = {}
+    for page in (1, 2):
+        html = fetch_player_list_page(session, season_id, page)
+        items = parse_player_list(html, season_id)
+        logger.info("페이지 %d: %d건 (HTML %d바이트, area_playerunit 매치 %d)",
+                    page, len(items), len(html), len(_PLAYERUNIT_RE.findall(html)))
+        total.update(items)
+    logger.info("합계 %d건, 예시 %s", len(total), list(total.items())[:5])
+    if not total:
+        logger.warning("0건 — strSeason 콤마 형식/마크업(area_playerunit_) 변경 여부를 확인해주세요")
+
+
 def sync_meta(engine, run_id: str) -> None:
     session = make_session()
     player_data = session.get(PLAYER_URL, timeout=30).json()
@@ -495,6 +665,14 @@ def sync_meta(engine, run_id: str) -> None:
                 "nsp": json.dumps(new_spids),
             },
         )
+
+    # 출시 당일 폴백: 시즌은 들어왔는데 spid 가 하나도 없는 최근 시즌 → 데이터센터 시드.
+    # (spid.json 이 seasonid.json 보다 늦어 목요일 crawl 이 빈손이 되는 것을 막는다.)
+    # ⚠️ 반드시 위 트랜잭션 **밖**에서. 시드는 수백 페이지 HTTP 라 트랜잭션 안에서 돌면
+    #    커넥션을 분 단위로 붙들어(idle in transaction) SSL 끊김·풀 고갈을 부른다.
+    #    시드된 spid 는 new_spids 에 합산돼 워크플로 게이트가 같은 시각에 crawl 을 연다.
+    if _env_int("META_SEED_DISABLE", 0) != 1 and spid_limit == 0:
+        new_spids.extend(_seed_spids_from_datacenter(engine, session, run_id))
 
     logger.info("sync 완료: 신규 spid=%d, 신규 시즌=%d", len(new_spids), len(new_seasons))
     _write_github_output(new_spids=len(new_spids), new_seasons=len(new_seasons))
@@ -800,6 +978,10 @@ def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     run_id = os.getenv("META_RUN_ID") or datetime.now(timezone.utc).strftime("%Y%m%d")
     mode = os.getenv("META_MODE", "crawl").strip().lower()
+
+    if mode == "seed-probe":
+        seed_probe()
+        return
 
     engine = make_engine()
     if mode == "sync":
