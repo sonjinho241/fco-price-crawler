@@ -38,12 +38,44 @@ DB의 `player.player_price_latest` 테이블에 upsert 한다. 이 표 덕분에
 
 ---
 
+## 🤖 운영 요약 — 메타 배치(`meta_crawler.py`)
+
+시세와 **완전히 다른 배치**다. 선수 능력치·특성·시즌 메타를 주간으로 맞춘다.
+
+| 배치 | 언제 | 무엇을 | 샤딩 |
+|---|---|---|---|
+| `meta-thursday.yml` | 목 10~23시 KST **매시 폴링** | `sync` 가 신규 spid/시즌을 감지한 시각에만 `crawl`(신규 카드만, `META_ONLY_NEW=1`) | 단일 잡 |
+| `meta-friday.yml` | 금 11:20 KST | 라이브 퍼포먼스 반영 직후 전체 재크롤, 콘텐츠 해시가 바뀐 카드만 write | **4샤드 병렬 matrix** |
+
+- **왜 목요일은 고정 시각이 아니라 폴링인가**: FC온라인 정기 패치는 목요일이지만 점검 종료
+  시각이 매주 다르다. 경량 `sync`(왕복 몇 번)로 폴링하다 신규가 잡힌 시각에만 크롤한다.
+- **⚠️ 두 샤딩을 같은 것으로 묶지 말 것.** 시세 = "6토막 **시간분산 sequential**(동시 1, 버스트
+  회피)", 메타 금요일 = "**4샤드 병렬**(주 1회라 같은 낮에 빨리 끝내려는 의도적 burst)". 목적이 반대다.
+- **출시 당일 폴백(데이터센터 시드)**: 넥슨 static 메타는 `seasonid.json` 이 먼저, `spid.json` 이
+  하루쯤 늦게 갱신된다. 그대로 두면 목요일에 시즌만 들어오고 그 시즌 spid 가 0개라 크롤이
+  빈손이 되고, 앱에는 선수 0명인 클래스 카드만 뜬다(2026-09-10 LKI2 실측). 그래서 `sync` 는
+  spid 가 0개인 최근 시즌을 데이터센터 `POST /datacenter/PlayerList` 에서 긁어
+  `crawled=FALSE` 로 시드한다. 시즌 파라미터는 `strSeason` 이고 값이 **`,879,` 처럼 앞뒤 콤마**다
+  (`879` 만 보내면 0건). 시드된 spid 는 `new_spids` 에 합산돼 같은 시각 crawl 게이트를 연다.
+  - 시드는 **트랜잭션 밖**에서 돈다. 수백 페이지 HTTP 를 트랜잭션 안에서 받으면 커넥션을
+    분 단위로 붙들어(idle in transaction) SSL 끊김·풀 고갈을 부른다.
+  - 마크업이 바뀌었는지 점검: Actions → **meta-seed-probe** → 시즌 ID 입력(DB 불필요).
+    로컬에서는 넥슨이 막힌 망이 많아 러너에서 돌리는 게 확실하다.
+- 알림은 `notify.py` 가 `player.meta_crawl_log` 를 모아 **카카오톡 요약 1통**, 실패 시 이메일 폴백.
+
+---
+
 ## 구조
 
 ```
-crawler_job.py                 # 자기완결형 크롤러 (이 파일 하나가 전부)
-requirements.txt               # requests, SQLAlchemy, psycopg2-binary
-.github/workflows/crawl.yml    # 하루 6회 cron(4시간 간격 샤딩) + 수동 실행
+crawler_job.py                 # 시세 크롤러 — 자기완결형 (이 파일 하나가 전부)
+meta_crawler.py                # 메타(능력치·특성·시즌) 크롤러 — sync / crawl / seed-probe
+notify.py                      # 메타 배치 결과 카카오톡 요약 1통 (실패 시 이메일 폴백)
+requirements.txt               # requests, SQLAlchemy, psycopg2-binary, beautifulsoup4
+.github/workflows/crawl.yml           # 시세: 하루 6회 cron(4시간 간격 샤딩) + 수동 실행
+.github/workflows/meta-thursday.yml   # 메타: 목 10~23시 KST 매시 폴링, 신규 감지 시에만 크롤
+.github/workflows/meta-friday.yml     # 메타: 금 11:20 KST 4샤드 병렬 풀크롤 + 해시 diff
+.github/workflows/meta-seed-probe.yml # 메타: 데이터센터 시드 파서 점검(수동, 시크릿 불필요)
 sql/crawler_role.sql           # 최소권한 전용 DB 롤 생성 SQL (Supabase에서 1회 실행)
 .env.example                   # 로컬 테스트용 예시 (.env 는 커밋 금지)
 ```
@@ -139,6 +171,18 @@ count=6                     # ← 이 숫자 = 위 cron 줄 수
 | `PRICE_LATEST_CHUNK_SIZE` | `4000` | 한 번에 처리하는 (spid,strong) 작업 수(메모리 상한) |
 | `PRICE_LATEST_DB_BATCH` | `500` | DB 에 한 번에 upsert 하는 행 수 |
 | `PRICE_LATEST_MAX_RETRIES` | `3` | 넥슨 호출 재시도 횟수 |
+
+메타 배치(`meta_crawler.py`) 전용:
+
+| 변수 | 기본 | 설명 |
+|---|---|---|
+| `META_MODE` | `crawl` | `sync`(메타 upsert+신규 감지) / `crawl` / `seed-probe`(DB 없이 파서 점검) |
+| `META_RUN_ID` | 날짜 | 한 실행을 묶는 ID. 워크플로가 `github.run_id` 로 주입 |
+| `META_ONLY_NEW` | `0` | `1` 이면 `crawled=FALSE` 인 spid 만 크롤(목요일 경량 모드) |
+| `META_WORKERS` / `META_REQUEST_DELAY` | `8` / `0.2` | HTML fetch 동시 스레드 수 / 요청 후 sleep |
+| `META_LIMIT` / `META_MAX_RETRIES` | `0` / `3` | spid 수 상한(0=전체, 테스트용) / 재시도 횟수 |
+| `META_SEED_DISABLE` | `0` | `1` 이면 `sync` 의 데이터센터 시드를 끈다 |
+| `META_SEED_SEASON` | — | `seed-probe` 로 점검할 시즌 ID (예 `879`) |
 
 ---
 
