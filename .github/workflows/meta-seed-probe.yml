@@ -1,0 +1,38 @@
+name: meta-seed-probe
+
+# 데이터센터 PlayerList 시드 파서만 점검하는 수동 워크플로(스모크).
+#
+# 왜 따로 두나: 시드 경로(sync 의 _seed_spids_from_datacenter)는 넥슨 마크업에 의존하는데,
+# 개발 PC 에서는 fconline.nexon.com 이 막혀 있어 로컬 검증이 안 된다. 러너(미국)에서는
+# 붙으므로 여기서 돌린다. DB 를 건드리지 않으므로 **시크릿이 필요 없다**.
+#
+# 결과 보는 법: 로그에 "페이지 1: N건" 이 찍히면 정상. 0건이면 strSeason 콤마 형식이나
+# area_playerunit_ 마크업이 바뀐 것이니 파서를 고쳐야 한다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      season_id:
+        description: "점검할 시즌 ID (예: 879 = LKI2)"
+        required: true
+        default: "879"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Probe datacenter PlayerList
+        env:
+          META_MODE: seed-probe
+          META_SEED_SEASON: ${{ github.event.inputs.season_id }}
+        run: python meta_crawler.py
