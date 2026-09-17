@@ -65,6 +65,31 @@ DB의 `player.player_price_latest` 테이블에 upsert 한다. 이 표 덕분에
 
 ---
 
+## 🤖 운영 요약 — 랭커 스쿼드 배치(`ranker_squad_job.py`)
+
+공식경기 1 ON 1 랭킹 **1만명의 대표팀 선발 11명**을 모아 "팀컬러 × 포지션 × 선수" 교차표를
+만든다. 넥슨은 팀컬러 순위와 포지션별 선수 순위를 각각 별개 표로만 주고 이 교차표는 안 준다.
+
+- **언제**: `ranker-squad.yml`, 일 04:00 KST 주 1회. 샤딩 없음(단일 잡, 스레드 8개, ~30분).
+- **무엇을 넣나**: `player.ranker_squad_snapshot`(원본, 랭커×11행) →
+  `player.team_color_player_usage`(집계). 회차 로그는 `player.ranker_squad_run`.
+  스키마·권한은 `sql/ranker_squad.sql` (실제 DB 에도 GRANT 해야 한다).
+- **경로**(모두 로그인 불필요):
+  `GET /datacenter/rank_inner?rt=1vs1&n4seasonno=0&n4pageno=N` (20행, 500페이지)
+  → `GET /profile/squad/popup/{sn}` (characterId)
+  → `GET /datacenter/SquadGetUserInfo?strTeamType=1&n1Type={1,2,3}&n8NexonSN=&strCharacterID=`
+- ⚠️ **`X-Requested-With: XMLHttpRequest` 없으면 `SquadGetUserInfo` 는 302.** 쿠키는 불필요.
+- ⚠️ 강화단계는 `players[].buildUp`. `lv` 는 빈 문자열이다.
+- ⚠️ 팀컬러 판정은 `totalTeamColor.affiliation` 에 넥슨이 넣어준 걸 그대로 쓴다. 단 넥슨의
+  팀컬러 번호는 우리 `team_colors.id` 와 체계가 달라 **이름으로 매칭**한다.
+- **어느 스쿼드를 쓰나**: 랭킹 표의 팀컬러(= 랭크에서 실제 쓴 덱)와 **이름이 일치하는**
+  대표팀 스쿼드만 채택한다. 대표 스쿼드부터 보고 아니면 A/B/C 를 훑고, 끝내 없으면 버린다
+  (매칭률 ~91%). "그냥 대표 스쿼드 쓰자"로 바꾸면 통계의 의미가 달라지니 주의.
+- **DB 없이 확인**: `RANKER_SQUAD_LIMIT=60 python ranker_squad_job.py --out s.json --report`
+  이미 뜬 덤프로 표만 다시: `python ranker_squad_job.py --from-json s.json --report "첼시"`
+
+---
+
 ## 구조
 
 ```

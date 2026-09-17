@@ -43,3 +43,12 @@ grant usage, select on all sequences in schema player to fco_crawler;
 --
 -- 접속문자열(직접 연결): postgresql://fco_crawler:비밀번호@db.<프로젝트ref>.supabase.co:5432/postgres
 -- 이 문자열을 repo Settings → Secrets and variables → Actions → DATABASE_URL 로 저장.
+
+-- 5) 랭커 스쿼드 크롤러(ranker_squad_job.py) 권한 — 2026-09 추가.
+--    테이블 정의와 동일한 grant 가 sql/ranker_squad.sql 에도 있다. 그 파일을
+--    실행했다면 여기 것은 다시 돌려도 무해하다(grant 는 멱등).
+grant select, insert, update, delete on player.ranker_squad_snapshot   to fco_crawler;
+grant select, insert, update, delete on player.team_color_player_usage to fco_crawler;
+grant select, insert, update         on player.ranker_squad_run        to fco_crawler;
+grant select, insert, update         on player.ranker_character_id     to fco_crawler;
+grant select                         on player.team_colors             to fco_crawler;

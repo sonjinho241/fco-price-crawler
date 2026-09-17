@@ -1,0 +1,53 @@
+name: ranker-squad
+
+# 공식경기 1 ON 1 랭킹 1만명의 대표팀 스쿼드(선발 11명)를 모아
+# "팀컬러 × 포지션 × 선수" 교차표를 만든다(ranker_squad_job.py).
+#
+# 주 1회면 충분하다 — 랭킹 1만명의 구성이 하루 만에 뒤집히지 않고, 요청 수가
+# 적지 않다(랭킹 500 + 랭커당 1~3건). 라이브 퍼포먼스가 반영되는 금요일 11:00 KST
+# 이후, 그리고 유저들이 새 메타로 스쿼드를 바꿀 시간을 준 **일요일 새벽**에 돈다.
+#
+# ⚠️ 샤딩하지 않는다. 한 프로세스가 스레드 workers 개로 도는 게 전부다(넥슨 쪽에
+#    부담을 몰아주지 않으려는 의도). 1만명 기준 ~40분.
+#
+# 넥슨 고지: 크롤링 데이터는 30일 내 갱신 의무. 주 1회면 충족한다.
+
+on:
+  schedule:
+    - cron: "0 19 * * 6"   # 토 19:00 UTC = 일 04:00 KST
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "테스트용 랭커 수 상한 (0=전체 10,000)"
+        required: false
+        default: "0"
+      workers:
+        description: "동시 요청 스레드 수"
+        required: false
+        default: "8"
+
+# 🔒 시크릿(DATABASE_URL)은 코드에 두지 않는다. pull_request 트리거 금지.
+permissions:
+  contents: read
+
+concurrency:
+  group: ranker-squad
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Collect ranker squads
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RANKER_SQUAD_LIMIT: ${{ github.event.inputs.limit || '0' }}
+          RANKER_SQUAD_WORKERS: ${{ github.event.inputs.workers || '8' }}
+        run: python ranker_squad_job.py
