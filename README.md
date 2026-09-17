@@ -65,17 +65,45 @@ DB의 `player.player_price_latest` 테이블에 upsert 한다. 이 표 덕분에
 
 ---
 
+## 🤖 운영 요약 — 팀컬러 이용률(`daily_squad_job.py`)
+
+앞의 둘과 또 다른 배치다. **선수 데이터가 아니라 "랭커들이 뭘 쓰는지"** 를 가져온다.
+
+| 배치 | 언제 | 무엇을 |
+|---|---|---|
+| `daily-squad.yml` | 매일 12:20 KST | 데이터센터 데일리 차트에서 팀컬러 이용률 30위를 받아 `player.team_color_usage` 를 갈아끼운다 |
+
+- **왜 이 배치가 존재하나**: 넥슨이 상위 1만 랭커의 전일 공식경기(1 ON 1) 스쿼드를 이미
+  집계해 공개한다. 우리가 랭커를 순회해 팀컬러를 역산할 이유가 없다 — 페이지 하나만 읽으면
+  된다. 넥슨 갱신이 매일 12:00 KST 라 그 직후에 돈다.
+- **과거분은 보관하지 않는다.** 같은 자리 `(match_mode, rank)` 를 덮어써 항상 30행이다.
+  테이블이 자라지 않고 조회도 전건 스캔이면 끝난다.
+- **⚠️ 실패하면 DB 를 건드리지 않는다.** 넥슨이 죽었든 마크업이 바뀌어 파싱이 빈손이든,
+  적재는 통째로 건너뛰고 종료 코드 1 로 끝난다. 앱에는 직전 성공분이 그대로 남고, 낡았다는
+  사실은 응답의 `stat_date` 로 드러난다. 반쯤 덮어쓴 상태는 나올 수 없다(단일 트랜잭션).
+- **⚠️ 파싱이 빈손이면 반드시 빨간불이 되게 해 두었다.** 조용히 넘어가면 앱이 몇 주 전 순위를
+  계속 보여줘도 아무도 모른다. `notify_failure.py` 가 카카오톡(실패 시 이메일)으로 알린다.
+- **⚠️ 팀컬러 식별자는 이름으로만 잇는다.** 데일리 차트의 `GetTeamColorVsInfo('1018')` 은
+  넥슨 데이터센터 내부 번호이고 우리 `player.team_colors.id` 와 **다른 체계**다(2026-09-17
+  실측: 30건 전부 불일치). 이름 매칭에 실패한 행은 버리지 않고 `team_color_id` 를 NULL 로
+  두고 경고를 남긴다 — 조용히 스킵하면 신규 팀컬러 누락을 놓친다.
+
+---
+
 ## 구조
 
 ```
 crawler_job.py                 # 시세 크롤러 — 자기완결형 (이 파일 하나가 전부)
 meta_crawler.py                # 메타(능력치·특성·시즌) 크롤러 — sync / crawl / seed-probe
+daily_squad_job.py             # 팀컬러 이용률 크롤러 — 자기완결형 (이 파일 하나가 전부)
 notify.py                      # 메타 배치 결과 카카오톡 요약 1통 (실패 시 이메일 폴백)
+notify_failure.py              # 배치 실패 알림 (집계할 로그가 없는 배치용)
 requirements.txt               # requests, SQLAlchemy, psycopg2-binary, beautifulsoup4
 .github/workflows/crawl.yml           # 시세: 하루 6회 cron(4시간 간격 샤딩) + 수동 실행
 .github/workflows/meta-thursday.yml   # 메타: 목 10~23시 KST 매시 폴링, 신규 감지 시에만 크롤
 .github/workflows/meta-friday.yml     # 메타: 금 11:20 KST 4샤드 병렬 풀크롤 + 해시 diff
 .github/workflows/meta-seed-probe.yml # 메타: 데이터센터 시드 파서 점검(수동, 시크릿 불필요)
+.github/workflows/daily-squad.yml     # 팀컬러 이용률: 매일 12:20 KST 1회 + 실패 알림
 sql/crawler_role.sql           # 최소권한 전용 DB 롤 생성 SQL (Supabase에서 1회 실행)
 .env.example                   # 로컬 테스트용 예시 (.env 는 커밋 금지)
 ```

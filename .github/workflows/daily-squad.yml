@@ -1,0 +1,57 @@
+name: daily-squad
+
+# 넥슨 데이터센터 데일리 차트(팀컬러 이용률)는 **매일 12:00 KST** 에 전일 기록으로
+# 갱신된다. 그 직후 한 번만 받아 player.team_color_usage 30행을 갈아끼운다.
+# 페이지 하나만 읽고 30행을 쓰는 아주 가벼운 배치라 샤딩도 분산도 필요 없다.
+#
+# 실패하면 DB 를 건드리지 않고 종료 코드 1 로 끝난다 → 앱은 직전 성공분을 계속
+# 보여주고, 아래 notify 스텝이 실패를 알린다. 조용히 넘어가면 앱이 몇 주 전 순위를
+# 보여줘도 아무도 모르기 때문에, 파싱이 빈손이면 반드시 빨간불이 되게 해 두었다.
+on:
+  schedule:
+    - cron: "20 3 * * *"   # 03:20 UTC = 12:20 KST (넥슨 갱신 직후, cron 지연 감안)
+  workflow_dispatch:
+
+# 최소권한. ⚠️ pull_request 트리거는 절대 추가하지 말 것(외부 fork 의 시크릿 노출 방지).
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-squad
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect team color usage
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python daily_squad_job.py
+
+      - name: Notify failure
+        if: failure()
+        env:
+          NOTIFY_LABEL: "팀컬러 이용률"
+          KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          # 이메일 폴백(선택). 없으면 카톡 실패 시 로그만 남는다.
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+        run: python notify_failure.py

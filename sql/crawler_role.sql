@@ -8,6 +8,7 @@
 -- 이 롤이 할 수 있는 것:
 --   시세 크롤러: player.players 읽기 + player.player_price_latest 읽기/쓰기
 --   메타 크롤러: player 스키마의 선수/시즌/spid/레퍼런스 테이블 읽기/쓰기 (아래 4번)
+--   팀컬러 이용률: player.team_color_usage 읽기/쓰기/삭제 (아래 5번)
 --
 -- ⚠️ 아래 비밀번호 자리는 실행할 때만 강력한 값으로 바꾸고, 이 파일에 평문으로
 --    저장하거나 커밋하지 마세요. 실행 후 접속문자열은 GitHub Secret 에만 보관.
@@ -35,6 +36,12 @@ grant select, insert         on player.team_colors    to fco_crawler;
 grant select, insert         on player.meta_crawl_log to fco_crawler;
 -- id 컬럼 default nextval() 용
 grant usage, select on all sequences in schema player to fco_crawler;
+
+-- 5) 팀컬러 이용률(daily_squad_job.py) 권한 — 2026-09 추가.
+--    30행을 매일 통째로 갈아끼운다: upsert(INSERT+UPDATE) + 꼬리 정리(DELETE).
+--    team_colors 는 이름→id 매칭에 읽기만 하며, 위 4번의 select 로 이미 충족된다.
+grant select, insert, update, delete on player.team_color_usage to fco_crawler;
+
 
 -- (참고) 권한 회수가 필요하면:
 --   revoke all on player.player_price_latest from fco_crawler;
