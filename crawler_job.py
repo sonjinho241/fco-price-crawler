@@ -12,7 +12,16 @@ FC Online 선수 "최신 시세만" 일일 크롤러 — 공개 저장소용 자
 
 넥슨 엔드포인트: POST https://fconline.nexon.com/datacenter/PlayerPriceGraph
   body: spid, n1strong(강화단계 1~13)
-  응답: HTML 안에 `var json1 = {time:[...], value:[...]}` (쿠키/CSRF 불필요)
+  응답: 하나의 HTML 안에 **두 가지 값**이 들어 있다 (쿠키/CSRF 불필요)
+
+    1. 현재가  — `var json1` 앞 마크업의 <strong alt="1,210,000,000">.
+       넥슨이 2시간 주기(홀수시 5분)로 갱신하는 기준가.
+    2. 일별 추이 — `var json1 = {time:[...], value:[...]}`. 하루 한 칸이고
+       **오늘 칸은 없다**(마지막 칸 = 어제).
+
+  player_price_latest 에 넣을 값은 **1번**이다. 2번의 마지막 칸을 쓰면 하루 늦은
+  값이 되어 앱의 검색·가격 필터·구단가치가 실제와 20~30%까지 어긋난다
+  (2026-09-28 규명·수정). 메인 저장소 prices/crawler.py 와 동일 로직을 유지한다.
 
 환경변수
     DATABASE_URL                (필수) Postgres 접속 문자열. 로그에 절대 출력 안 함.
@@ -34,8 +43,8 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, timedelta
-from typing import List, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import List, NamedTuple, Optional, Tuple
 
 import requests
 from sqlalchemy import (
@@ -80,6 +89,15 @@ BASE_URL = "https://fconline.nexon.com/datacenter/PlayerPriceGraph"
 
 _TIME_RE = re.compile(r'"(\d+\.\d+)"')   # "6.23"
 _NUM_RE = re.compile(r'"(\d+)"')          # "442777777800"
+# 현재가: json1 앞 마크업의 <strong alt="1,210,000,000">.
+_CURRENT_PRICE_RE = re.compile(r'<strong[^>]*\salt="([\d,]+)"')
+
+# 배치는 UTC(GitHub Actions)로 돌므로 수집 날짜는 KST 로 고정한다.
+_KST = timezone(timedelta(hours=9))
+
+
+def _today_kst() -> date:
+    return datetime.now(_KST).date()
 
 
 def make_session() -> requests.Session:
@@ -89,6 +107,23 @@ def make_session() -> requests.Session:
         "X-Requested-With": "XMLHttpRequest",
     })
     return s
+
+
+class PriceSnapshot(NamedTuple):
+    """한 번의 넥슨 호출로 얻는 두 가지 값."""
+
+    current_price: Optional[int]        # 지금 기준가. 거래 불가(0)면 None
+    history: List[Tuple[date, int]]     # 일별 추이 (마지막 칸 = 어제)
+
+
+def _parse_current_price(html: str) -> Optional[int]:
+    """json1 앞 마크업에서 현재가를 읽는다. 없거나 0(거래 불가)이면 None."""
+    head = html[:html.find("var json1")] if "var json1" in html else html
+    match = _CURRENT_PRICE_RE.search(head)
+    if match is None:
+        return None
+    price = int(match.group(1).replace(",", ""))
+    return price or None
 
 
 def _parse_json1(html: str):
@@ -115,8 +150,10 @@ def _to_dates(times, end: date):
     return [end - timedelta(days=n - 1 - i) for i in range(n)]
 
 
-def fetch_price_history(session, spid, strong, end=None, recent_days=None, timeout=15):
-    """특정 선수/강화단계 시세를 [(date, price), ...] 로 반환. 빈 값이면 []."""
+def fetch_price_snapshot(
+    session, spid, strong, end=None, recent_days=None, timeout=15
+) -> PriceSnapshot:
+    """특정 선수/강화단계의 현재가 + 일별 추이를 한 번의 호출로 받는다."""
     end = end or (date.today() - timedelta(days=1))
     headers = {"Referer": f"https://fconline.nexon.com/DataCenter/PlayerInfo?spid={spid}"}
 
@@ -128,15 +165,17 @@ def fetch_price_history(session, spid, strong, end=None, recent_days=None, timeo
     )
     res.raise_for_status()  # 429/5xx 는 여기서 예외 → 호출부에서 백오프 재시도
 
+    current_price = _parse_current_price(res.text)
+
     times, values = _parse_json1(res.text)
     if not times:
-        return []
+        return PriceSnapshot(current_price=current_price, history=[])
 
     dates = _to_dates(times, end)
     rows = list(zip(dates, values))
     if recent_days:
         rows = rows[-recent_days:]
-    return rows
+    return PriceSnapshot(current_price=current_price, history=rows)
 
 
 # =============================================================================
@@ -223,6 +262,12 @@ def bulk_upsert_latest(engine, rows: List[dict]) -> int:
     Disk IO 예산을 갉아먹는다(이 크롤러가 하루 6번 도므로 누적이 크다). 그래서
     값이 실제로 변한 행만 쓴다. 이 때문에 updated_at 의 의미는 "마지막 확인 시각"이
     아니라 "마지막으로 price 가 바뀐 시각"이 된다.
+
+    ⚠️ 2026-09-28 부터 price 가 일별 추이 마지막 칸이 아니라 넥슨 "현재가"다.
+    현재가는 2시간마다 움직이므로 하루 1회만 바뀌던 예전보다 **이 조건을 통과하는
+    행이 늘어난다** = dead tuple/WAL 도 는다. 거래가 없는 대다수 선수는 여전히
+    스킵되지만, 이 변경 후 첫 며칠은 Supabase Disk IO 를 확인할 것.
+    늘면 배치 횟수(하루 6회)를 줄이는 쪽이 먼저다.
 
     ⚠️ 커넥션은 호출마다 새로 체크아웃한다(엔진을 받는 이유). 이 배치는 한 샤드가
     한 시간 넘게 도는데, 그동안 커넥션 하나를 붙들고 있으면 flush 사이 ~95초씩
@@ -321,15 +366,28 @@ def _chunked(items, size: int):
 
 
 def _fetch_one(session, spid: int, strong: int, max_retries: int, delay: float) -> Optional[dict]:
-    """(spid, strong) 의 최신 시세 1줄을 받아온다. 빈 값/실패면 None."""
+    """(spid, strong) 의 최신 시세 1줄을 받아온다. 빈 값/실패면 None.
+
+    price 는 넥슨 "현재가"(2시간 주기 기준가)다. 일별 추이의 마지막 칸은 어제 값이라
+    앱의 검색·가격 필터·구단가치가 하루 늦은 값으로 계산됐다(2026-09-28 수정).
+    현재가가 없는 거래 불가 선수만 예전처럼 추이 마지막 칸으로 폴백한다 —
+    그래야 그 선수들이 가격 필터에서 통째로 사라지지 않는다.
+    """
     for attempt in range(max_retries):
         try:
-            rows = fetch_price_history(session, spid, strong, recent_days=1)
+            snapshot = fetch_price_snapshot(session, spid, strong, recent_days=1)
             if delay:
                 time.sleep(delay)
-            if not rows:
+            if snapshot.current_price is not None:
+                return {
+                    "spid": spid,
+                    "strong": strong,
+                    "price": snapshot.current_price,
+                    "price_date": _today_kst(),
+                }
+            if not snapshot.history:
                 return None
-            last_date, last_price = rows[-1]
+            last_date, last_price = snapshot.history[-1]
             return {
                 "spid": spid,
                 "strong": strong,
