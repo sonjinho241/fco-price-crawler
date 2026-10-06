@@ -25,6 +25,7 @@ player.meta_crawl_log 에 적는다.
 
   crawl  : (기본) player.spid 전체를 SHARD 로 나눠 자기 몫만 크롤. 카드 해시 비교 후
            신규/변경만 write. 샤드별 결과를 phase='crawl' 로그로 남긴다.
+           같은 run 의 sync 가 phase='gone' 로그를 남겼으면 그 spid(넥슨이 지운 카드)는 뺀다.
            META_ONLY_NEW=1 이면 crawled=FALSE 인 spid(=sync 가 방금 넣은 신규 +
            과거 크롤 실패분)만 크롤한다(목요일 폴링용 경량 모드).
 
@@ -55,6 +56,8 @@ player.meta_crawl_log 에 적는다.
     META_ONLY_NEW           '1' 이면 crawl 대상을 crawled=FALSE 인 spid 로 한정 (기본 0)
     META_SEED_SEASON        seed-probe 모드에서 점검할 시즌 ID (예 879)
     META_SEED_DISABLE       '1' 이면 sync 의 데이터센터 시드를 끈다 (기본 0)
+    META_DETECT_GONE        '1' 이면 sync 가 spid.json 에서 빠진 spid 를 'gone' 로그로 남긴다
+                            (금요일 풀크롤 전용, 기본 0)
 
 로컬 테스트:
     DATABASE_URL=postgresql://... META_MODE=sync python meta_crawler.py
@@ -69,7 +72,7 @@ import re
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -611,6 +614,73 @@ def seed_probe() -> None:
         logger.warning("0건 — strSeason 콤마 형식/마크업(area_playerunit_) 변경 여부를 확인해주세요")
 
 
+# ── 넥슨이 지운 카드(spid.json 에서 빠진 spid) ─────────────────────────────────
+# sync 는 player.spid 에 넣기만 하고 지우지 않는다. 그래서 넥슨이 내린 카드(2026-08 의
+# ICON TM 야신 1장, HRT 70짜리 4장)가 금요일 풀크롤마다 상세 페이지 파싱에 실패해
+# 매주 "크롤 실패 5건" 을 만들었다. sync 가 이런 spid 를 phase='gone' 로그로 남기면
+# 같은 run 의 crawl 샤드들이 그 목록을 읽어 풀크롤 대상에서 뺀다(샤드마다 따로
+# spid.json 을 받으면 받는 시각 차로 샤드 분할이 어긋날 수 있어 sync 한 곳에서 정한다).
+#
+# 판정 = crawled=TRUE 이고, spid.json 에 없고, **그 시즌은 spid.json 에 있는** spid.
+#   · crawled=FALSE 는 방금 시드/sync 된 대기분이라 제외(목요일 크롤 몫).
+#   · 시즌째 빠졌으면 spid.json 갱신 지연(9/10 LKI2 처럼 하루 늦는 경우)일 수 있어 제외.
+# 행은 지우지 않는다(players 노출 여부는 별도 결정 사항). 넥슨이 되살리면 다음 sync 부터
+# 자동으로 다시 크롤 대상이 된다.
+_ALL_CRAWLED_SPIDS_SQL = text(f"""
+    SELECT spid, crawled_at FROM {PLAYER_SCHEMA}.spid WHERE crawled = TRUE
+""")
+
+# 이 기간 안에 정상 크롤된 적이 있으면 "이번 주에 새로 사라진" 카드로 본다(알림용).
+# 금요일 풀크롤 주기 7일 + cron 지연 여유 1일.
+_GONE_FRESH_DAYS = 8
+
+
+def _log_gone_spids(engine, run_id: str, player_data: list) -> None:
+    listed = {int(p["id"]) for p in player_data}
+    listed_seasons = {spid // 1_000_000 for spid in listed}
+    fresh_since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=_GONE_FRESH_DAYS)
+
+    gone: List[int] = []
+    newly_gone: List[int] = []
+    with engine.connect() as conn:
+        for r in conn.execute(_ALL_CRAWLED_SPIDS_SQL):
+            if r.spid in listed or r.spid // 1_000_000 not in listed_seasons:
+                continue
+            gone.append(r.spid)
+            # crawled_at 은 naive UTC(now() 를 timestamp without tz 에 적재).
+            if r.crawled_at is not None and r.crawled_at >= fresh_since:
+                newly_gone.append(r.spid)
+        gone.sort()
+        newly_gone.sort()
+        conn.execute(
+            text(f"""
+                INSERT INTO {PLAYER_SCHEMA}.meta_crawl_log
+                    (run_id, phase, new_players, new_spids)
+                VALUES (:rid, 'gone', :n, CAST(:detail AS jsonb))
+            """),
+            {
+                "rid": run_id,
+                "n": len(newly_gone),
+                "detail": json.dumps({"gone": gone, "newly_gone": newly_gone}),
+            },
+        )
+        conn.commit()
+    logger.info("넥슨에서 사라진 spid=%d (이번 주 신규 %d): %s", len(gone), len(newly_gone), gone[:20])
+
+
+_GONE_SPIDS_SQL = text(f"""
+    SELECT new_spids FROM {PLAYER_SCHEMA}.meta_crawl_log
+    WHERE run_id = :rid AND phase = 'gone'
+    ORDER BY created_at DESC LIMIT 1
+""")
+
+
+def read_gone_spids(conn, run_id: str) -> set:
+    """같은 run 의 sync 가 남긴 사라진 spid. 로그가 없으면(목요일·수동 실행) 빈 집합."""
+    detail = conn.execute(_GONE_SPIDS_SQL, {"rid": run_id}).scalar()
+    return set((detail or {}).get("gone") or [])
+
+
 def sync_meta(engine, run_id: str) -> None:
     session = make_session()
     player_data = session.get(PLAYER_URL, timeout=30).json()
@@ -665,6 +735,11 @@ def sync_meta(engine, run_id: str) -> None:
                 "nsp": json.dumps(new_spids),
             },
         )
+
+    # 넥슨이 지운 카드 감지(금요일 풀크롤 전용). 시드보다 먼저 — 시드분은 아직 spid.json 에
+    # 없어서 섞이면 사라진 카드로 오판한다.
+    if _env_int("META_DETECT_GONE", 0) == 1 and spid_limit == 0:
+        _log_gone_spids(engine, run_id, player_data)
 
     # 출시 당일 폴백: 시즌은 들어왔는데 spid 가 하나도 없는 최근 시즌 → 데이터센터 시드.
     # (spid.json 이 seasonid.json 보다 늦어 목요일 crawl 이 빈손이 되는 것을 막는다.)
@@ -845,6 +920,11 @@ def crawl_shard(engine, run_id: str) -> None:
     engine_conn = engine.connect()
     with engine_conn:
         all_spids = read_target_spids(engine_conn, only_new)
+        gone = set() if only_new else read_gone_spids(engine_conn, run_id)
+        if gone:
+            # 샤드 분할 전에 빼야 모든 샤드가 같은 목록을 같은 방식으로 나눈다.
+            all_spids = [s for s in all_spids if s not in gone]
+            logger.info("넥슨에서 사라진 spid %d개 제외", len(gone))
         if spid_limit > 0:
             all_spids = all_spids[:spid_limit]
         spids, index, count = _shard(all_spids)

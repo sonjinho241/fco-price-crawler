@@ -56,6 +56,8 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           META_MODE: sync
           META_LIMIT: ${{ github.event.inputs.limit || '0' }}
+          # 넥슨이 지운 카드를 'gone' 로그로 남겨 아래 crawl 이 건너뛰게 한다.
+          META_DETECT_GONE: "1"
         run: python meta_crawler.py
 
   # ── 2) crawl: 전체 선수를 4샤드 병렬 재크롤. 해시 바뀐 카드만 write ──

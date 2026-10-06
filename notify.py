@@ -154,9 +154,16 @@ def aggregate(engine, run_id: str) -> dict:
                           # static 메타로 들어온 신규 시즌 + 데이터센터 시드 행)
     new_spids = []
     career = None         # career_job.py 결과(phase='career'). 잡이 안 돌았으면 None.
+    gone_total = 0        # 넥슨이 지워 크롤에서 뺀 spid 수(phase='gone', 금요일만)
+    newly_gone = []       # 그중 이번 주에 새로 사라진 것
 
     for r in rows:
-        if r["phase"] == "career":
+        if r["phase"] == "gone":
+            # gone 행도 new_spids 칸에 세부 dict 를 담는다(meta_crawler._log_gone_spids).
+            detail = r["new_spids"] or {}
+            gone_total = len(detail.get("gone") or [])
+            newly_gone = list(detail.get("newly_gone") or [])
+        elif r["phase"] == "career":
             # career 행은 new_spids 칸에 세부 dict 를 담는다(career_job._log_result).
             detail = r["new_spids"] or {}
             career = career or {"new": 0, "changed": 0, "failures": 0,
@@ -188,6 +195,8 @@ def aggregate(engine, run_id: str) -> dict:
     # 크롤 실패분은 players 에 없어 조용히 빠진다(미리보기라 실패는 🔴 줄이 따로 알린다).
     top_new = _top_new_players(engine, new_spids, top_n)
     top_changed = _top_changed_players(engine, run_id, top_n) if changed else []
+    # 사라진 카드도 players 행은 남아 있어 신규 미리보기와 같은 조회로 이름을 얻는다.
+    top_gone = _top_new_players(engine, newly_gone, top_n)
 
     return {
         "run_id": run_id,
@@ -204,6 +213,9 @@ def aggregate(engine, run_id: str) -> dict:
         "shards_expected": expected,
         "missing_shards": expected - len(crawl_shards),
         "career": career,
+        "gone_total": gone_total,
+        "newly_gone_count": len(newly_gone),
+        "top_gone": top_gone,
         # 워크플로가 career 잡을 돌렸는데 로그가 없으면(잡이 로그 전에 죽음) 경고 줄을 띄운다.
         "career_expected": os.getenv("EXPECT_CAREER", "0") == "1",
     }
@@ -290,6 +302,11 @@ def build_message(s: dict, max_len: Optional[int] = None) -> str:
         lines.append("• 신규: " + _card_preview(s["top_new"], s["new_spid_count"]))
     if s["top_changed"]:
         lines.append("• 변동: " + _card_preview(s["top_changed"], s["changed"], unit="장"))
+    # 넥슨이 지운 카드는 크롤에서 빼므로 실패로 세지 않는다. 이번 주에 새로 빠진 것만
+    # 알린다(이미 알린 카드를 매주 반복하면 예전 "실패 5건" 과 같은 소음이 된다).
+    if s.get("newly_gone_count"):
+        lines.append("• 사라진 카드(크롤 제외): "
+                     + _card_preview(s["top_gone"], s["newly_gone_count"], unit="장"))
 
     career = s.get("career")
     career_quiet = (
@@ -300,7 +317,8 @@ def build_message(s: dict, max_len: Optional[int] = None) -> str:
     )
     if (s["new_players"] == 0 and s["changed"] == 0 and not s["new_traits"]
             and not s.get("new_team_colors") and not s["new_seasons"]
-            and s["failures"] == 0 and s["missing_shards"] == 0 and career_quiet):
+            and s["failures"] == 0 and s["missing_shards"] == 0 and career_quiet
+            and not s.get("newly_gone_count")):
         lines.append("변동 없음 (정상 동작)")
 
     msg = "\n".join(lines)
