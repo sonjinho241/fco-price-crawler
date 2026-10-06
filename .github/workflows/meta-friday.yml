@@ -10,8 +10,13 @@ name: meta-friday
 #    시세 = 6토막 "시간분산 sequential(동시 1, 버스트 회피)".
 #    이것 = crawl 단계 4샤드 "병렬 matrix(주 1회라 같은 낮에 빨리 끝내려는 의도적 burst)".
 #
-# 단계: sync(신규 spid/시즌 upsert, 1회) → crawl(4샤드 병렬 풀크롤) → notify(카톡 요약).
-# 세 단계 모두 META_RUN_ID = github.run_id 로 묶여 meta_crawl_log 에서 집계된다.
+# 클럽 경력(career_job.py)도 여기서 주 1회 전량 비교한다. 넥슨은 경력을 목요일 점검에
+# 묶어 반영하므로(월 1회 안팎, 불규칙) 금요일이면 그 주 반영분을 하루 안에 따라잡는다.
+# 넥슨 요청이 겹치지 않게 능력치 crawl 이 끝난 뒤 순차로 돈다(~40분).
+#
+# 단계: sync(신규 spid/시즌 upsert, 1회) → crawl(4샤드 병렬 풀크롤) → career(경력 전량 비교)
+#       → notify(요약 1통, 경력은 한 줄).
+# 모든 단계가 META_RUN_ID = github.run_id 로 묶여 meta_crawl_log 에서 집계된다.
 
 on:
   schedule:
@@ -78,10 +83,31 @@ jobs:
           META_LIMIT: ${{ github.event.inputs.limit || '0' }}
         run: python meta_crawler.py
 
-  # ── 3) notify: meta_crawl_log 를 run_id 로 모아 카카오톡 요약 1통 ──
-  notify:
+  # ── 3) career: 클럽 경력 전량 재크롤, 바뀐 선수만 write (+ 소속 필터 파생 갱신) ──
+  # 앱 디테일 "클럽 경력" 탭은 player_career 를 실시간 조회하므로 여기서 쓰면 바로 반영된다.
+  career:
     needs: crawl
-    if: always()           # 일부 샤드 실패해도 요약은 보낸다
+    if: ${{ !cancelled() }}  # 능력치 샤드가 일부 실패해도 경력은 돈다(서로 독립)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90      # ~5.1만 pid, 8스레드 ~23 req/s 실측 기준 ~40분 예상
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Crawl club career (full diff)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CAREER_MODE: full
+          CAREER_LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: python career_job.py
+
+  # ── 4) notify: meta_crawl_log 를 run_id 로 모아 요약 1통 ──
+  notify:
+    needs: [crawl, career]
+    if: always()           # 일부 샤드·경력 잡이 실패해도 요약은 보낸다
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -95,6 +121,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           EXPECTED_SHARDS: "4"
+          EXPECT_CAREER: "1"
           NOTIFY_LABEL: "금요일 라이브"
           KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}

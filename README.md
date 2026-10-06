@@ -61,7 +61,42 @@ DB의 `player.player_price_latest` 테이블에 upsert 한다. 이 표 덕분에
     분 단위로 붙들어(idle in transaction) SSL 끊김·풀 고갈을 부른다.
   - 마크업이 바뀌었는지 점검: Actions → **meta-seed-probe** → 시즌 ID 입력(DB 불필요).
     로컬에서는 넥슨이 막힌 망이 많아 러너에서 돌리는 게 확실하다.
-- 알림은 `notify.py` 가 `player.meta_crawl_log` 를 모아 **카카오톡 요약 1통**, 실패 시 이메일 폴백.
+- 알림은 `notify.py` 가 `player.meta_crawl_log` 를 모아 **요약 1통**을 보낸다. 카톡을 먼저
+  시도하고 실패하면 이메일로 보내는데, 카톡 시크릿을 등록하지 않아 **현재 실제 수신은 Gmail**이다.
+
+---
+
+## 🤖 운영 요약 — 클럽 경력 배치(`career_job.py`)
+
+앱 선수 디테일의 **"클럽 경력" 탭**과 리그/팀/현역 **소속 필터**의 원본을 넥슨에 맞춘다.
+백엔드 `GET /players/{id}` 가 `player.player_career` 를 캐시 없이 그대로 읽으므로, 여기서
+쓰면 **앱/서버 배포 없이** 다음 화면 진입부터 반영된다.
+
+| 언제 | 모드 | 무엇을 |
+|---|---|---|
+| `meta-friday.yml` 의 `career` 잡 (능력치 crawl 뒤) | `full` | 전체 ~5.1만 pid 재크롤 → 바뀐 선수만 write (~40분) |
+| `meta-thursday.yml` 의 crawl 잡 마지막 단계 | `pending` | `player_career` 에 아직 없는 새 선수만 |
+
+- **왜 주 1회 금요일인가**: 넥슨은 경력을 **목요일 정기점검에 묶어** 일괄 반영한다(사전 안내
+  공지가 1주 전쯤 뜬다). 대략 월 1회 안팎이고 불규칙하다(2025-07-24 1,821명, 2026-08-20
+  4,496명, 2026-09-10 등). 공지를 읽어 그 주에만 돌리는 방식은 공지 형식이 바뀌면 조용히
+  깨지므로, 매주 전량 비교하고 바뀐 것만 쓴다. 갱신 없는 주는 write 0.
+- **pid 단위**: 경력은 카드가 아니라 실존 선수(pid = spid % 1000000)의 속성이라 pid 당
+  대표 spid(MIN) 1장만 요청한다(시즌이 달라도 같음 — 2026-10 이적 선수 36명 교차 확인).
+- **⚠️ 보호 장치**
+  - 진짜 빈 경력 페이지에도 경력 표(`div.data_detail_club`)는 있고 `<ul>` 만 비어 있다(전체의
+    약 절반, 정상). 표 자체가 없으면(점검 페이지·없는 spid) **실패로 세고 쓰지 않는다**.
+  - 경력이 있던 선수가 빈 경력으로 응답하면 쓰지 않고 "빈경력 보류"로 보고한다.
+  - 청크(2000) 실패율이 20%를 넘으면 그 청크부터 중단, 잡은 빨간불(요약은 그래도 간다).
+- **소속 필터 파생**: 바뀐 pid 만 `player_career_clubs` 를 DELETE+INSERT(경력 upsert 와 같은
+  트랜잭션). 규칙은 백엔드 `scripts/build_player_career_clubs.py` 와 같다 — 한쪽을 바꾸면 양쪽.
+  저쪽(전량 TRUNCATE 재빌드)은 그동안 필터가 비어 보여 수동 복구용으로만 쓴다.
+- **알림**: 요약 본문에 한 줄 — `⚪ 클럽경력 변경 1,234  신규 12` (목요일은 `신규`만).
+  `⚠️ 클럽경력 중단` / `⚠️ 클럽경력 결과 없음` 이 보이면 Actions 로그를 본다.
+  로그 행은 `meta_crawl_log.phase='career'`, 세부(dict)는 `new_spids` 칸을 빌려 쓴다.
+- **권한**: `sql/crawler_role.sql` 6번(player_career / player_career_clubs / clubs).
+- **DB 없이 마크업 점검**: `CAREER_MODE=probe CAREER_PROBE_SPIDS=866200104,321166853,100999999 python career_job.py`
+  (경력 있음 / 빈 경력 / 없는 spid 순으로 `N건` / `0건` / `실패` 가 나와야 정상)
 
 ---
 
@@ -95,11 +130,12 @@ DB의 `player.player_price_latest` 테이블에 upsert 한다. 이 표 덕분에
 ```
 crawler_job.py                 # 시세 크롤러 — 자기완결형 (이 파일 하나가 전부)
 meta_crawler.py                # 메타(능력치·특성·시즌) 크롤러 — sync / crawl / seed-probe
-notify.py                      # 메타 배치 결과 카카오톡 요약 1통 (실패 시 이메일 폴백)
+career_job.py                  # 클럽 경력 — full(금, 전량 diff) / pending(목, 새 선수) / probe
+notify.py                      # 메타·경력 배치 결과 요약 1통 (카톡 시도 → 이메일, 현재 Gmail 수신)
 requirements.txt               # requests, SQLAlchemy, psycopg2-binary, beautifulsoup4
 .github/workflows/crawl.yml           # 시세: 하루 6회 cron(4시간 간격 샤딩) + 수동 실행
 .github/workflows/meta-thursday.yml   # 메타: 목 10~23시 KST 매시 폴링, 신규 감지 시에만 크롤
-.github/workflows/meta-friday.yml     # 메타: 금 11:20 KST 4샤드 병렬 풀크롤 + 해시 diff
+.github/workflows/meta-friday.yml     # 메타: 금 11:20 KST 4샤드 병렬 풀크롤 + 해시 diff → 클럽 경력 전량 diff
 .github/workflows/meta-seed-probe.yml # 메타: 데이터센터 시드 파서 점검(수동, 시크릿 불필요)
 sql/crawler_role.sql           # 최소권한 전용 DB 롤 생성 SQL (Supabase에서 1회 실행)
 .env.example                   # 로컬 테스트용 예시 (.env 는 커밋 금지)
@@ -208,6 +244,17 @@ count=6                     # ← 이 숫자 = 위 cron 줄 수
 | `META_LIMIT` / `META_MAX_RETRIES` | `0` / `3` | spid 수 상한(0=전체, 테스트용) / 재시도 횟수 |
 | `META_SEED_DISABLE` | `0` | `1` 이면 `sync` 의 데이터센터 시드를 끈다 |
 | `META_SEED_SEASON` | — | `seed-probe` 로 점검할 시즌 ID (예 `879`) |
+
+클럽 경력 배치(`career_job.py`) 전용:
+
+| 변수 | 기본 | 설명 |
+|---|---|---|
+| `CAREER_MODE` | `full` | `full`(전량 diff) / `pending`(새 선수만) / `probe`(DB 없이 파서 점검) |
+| `CAREER_WORKERS` / `CAREER_REQUEST_DELAY` | `8` / `0.1` | 동시 요청 스레드 수 / 요청 후 sleep |
+| `CAREER_LIMIT` / `CAREER_MAX_RETRIES` | `0` / `3` | pid 수 상한(0=전체, 테스트용) / 재시도 횟수 |
+| `CAREER_CHUNK_SIZE` / `CAREER_DB_BATCH` | `2000` / `200` | 실패율 판정 단위 / 한 트랜잭션에 쓰는 pid 수 |
+| `CAREER_MAX_FAIL_RATE` | `0.2` | 청크 실패율 상한. 넘으면 중단 |
+| `CAREER_PROBE_SPIDS` | 예시 3개 | `probe` 모드에서 볼 spid (콤마 구분) |
 
 ---
 

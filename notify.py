@@ -12,6 +12,7 @@ run_id 로 모아 집계한다.
     META_RUN_ID           (필수) 이 실행 ID. meta_crawl_log 집계 키
     EXPECTED_SHARDS       crawl 샤드 수(기본 4). 로그된 샤드가 이보다 적으면 "샤드 누락" 경고
     NOTIFY_TOP_N          신규 선수 미리보기 인원(기본 5, 0=미리보기 끔)
+    EXPECT_CAREER         '1' 이면 이 실행에 career_job.py 가 돈다는 뜻. 그 로그가 없으면 경고 줄
     KAKAO_REST_KEY        카카오 디벨로퍼스 REST API 키
     KAKAO_REFRESH_TOKEN   카카오 OAuth refresh token(1회 발급해 Secret 저장)
     SMTP_HOST/PORT/USER/PASS, NOTIFY_EMAIL_TO   (선택) 카톡 실패 시 이메일 폴백
@@ -152,9 +153,21 @@ def aggregate(engine, run_id: str) -> dict:
     new_seasons = {}      # season_id -> dict (sync 행이 여러 개일 수 있어 id 로 합친다:
                           # static 메타로 들어온 신규 시즌 + 데이터센터 시드 행)
     new_spids = []
+    career = None         # career_job.py 결과(phase='career'). 잡이 안 돌았으면 None.
 
     for r in rows:
-        if r["phase"] == "crawl":
+        if r["phase"] == "career":
+            # career 행은 new_spids 칸에 세부 dict 를 담는다(career_job._log_result).
+            detail = r["new_spids"] or {}
+            career = career or {"new": 0, "changed": 0, "failures": 0,
+                                "emptied_skipped": 0, "aborted": False, "mode": ""}
+            career["new"] += r["new_players"] or 0
+            career["changed"] += r["changed"] or 0
+            career["failures"] += r["failures"] or 0
+            career["emptied_skipped"] += detail.get("emptied_skipped") or 0
+            career["aborted"] = career["aborted"] or bool(detail.get("aborted"))
+            career["mode"] = detail.get("mode") or career["mode"]
+        elif r["phase"] == "crawl":
             new_players += r["new_players"] or 0
             changed += r["changed"] or 0
             failures += r["failures"] or 0
@@ -190,6 +203,9 @@ def aggregate(engine, run_id: str) -> dict:
         "shards_logged": len(crawl_shards),
         "shards_expected": expected,
         "missing_shards": expected - len(crawl_shards),
+        "career": career,
+        # 워크플로가 career 잡을 돌렸는데 로그가 없으면(잡이 로그 전에 죽음) 경고 줄을 띄운다.
+        "career_expected": os.getenv("EXPECT_CAREER", "0") == "1",
     }
 
 
@@ -198,6 +214,26 @@ def _card_preview(cards: list, total: int, unit: str = "명") -> str:
     body = ", ".join(f"{abbrev} {name}".strip() for abbrev, name in cards)
     more = total - len(cards)
     return body + (f" 외 {more}{unit}" if more > 0 else "")
+
+
+def _career_line(s: dict) -> Optional[str]:
+    """클럽 경력 결과 한 줄. 경력 잡을 안 도는 실행이면 None.
+
+    목요일(pending)은 새 선수만 긁고 기존 경력은 보지 않으므로 '변경'을 빼고 '신규'만 쓴다.
+    """
+    c = s.get("career")
+    if c is None:
+        return "⚠️ 클럽경력 결과 없음 (잡 실패 의심)" if s.get("career_expected") else None
+    parts = []
+    if c["mode"] != "pending":
+        parts.append(f"변경 {c['changed']:,}")
+    parts.append(f"신규 {c['new']:,}")
+    if c["failures"]:
+        parts.append(f"실패 {c['failures']:,}")
+    if c["emptied_skipped"]:
+        parts.append(f"빈경력 보류 {c['emptied_skipped']:,}")
+    head = "⚠️ 클럽경력 중단" if c["aborted"] else "⚪ 클럽경력"
+    return head + " " + "  ".join(parts)
 
 
 def build_message(s: dict, max_len: Optional[int] = None) -> str:
@@ -221,6 +257,10 @@ def build_message(s: dict, max_len: Optional[int] = None) -> str:
         f"🟡 신규특성 {len(s['new_traits'])}  🟣 신규시즌 {len(s['new_seasons'])}"
         f"  🟠 신규팀컬러 {len(s.get('new_team_colors') or {})}"
     )
+    # 클럽 경력도 집계 줄 묶음에 둔다(아래 미리보기보다 위 — 길이 제한에 잘려도 남게).
+    career_line = _career_line(s)
+    if career_line:
+        lines.append(career_line)
 
     # 미리보기는 집계 아래로 — 길이 초과로 잘려도 위의 경고/집계는 살아남는다.
     if s["new_traits"]:
@@ -251,9 +291,16 @@ def build_message(s: dict, max_len: Optional[int] = None) -> str:
     if s["top_changed"]:
         lines.append("• 변동: " + _card_preview(s["top_changed"], s["changed"], unit="장"))
 
+    career = s.get("career")
+    career_quiet = (
+        (career is None and not s.get("career_expected"))
+        or (career is not None and career["new"] == 0 and career["changed"] == 0
+            and career["failures"] == 0 and career["emptied_skipped"] == 0
+            and not career["aborted"])
+    )
     if (s["new_players"] == 0 and s["changed"] == 0 and not s["new_traits"]
             and not s.get("new_team_colors") and not s["new_seasons"]
-            and s["failures"] == 0 and s["missing_shards"] == 0):
+            and s["failures"] == 0 and s["missing_shards"] == 0 and career_quiet):
         lines.append("변동 없음 (정상 동작)")
 
     msg = "\n".join(lines)

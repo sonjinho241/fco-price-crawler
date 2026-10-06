@@ -52,3 +52,11 @@ grant select, insert, update, delete on player.team_color_player_usage to fco_cr
 grant select, insert, update         on player.ranker_squad_run        to fco_crawler;
 grant select, insert, update         on player.ranker_character_id     to fco_crawler;
 grant select                         on player.team_colors             to fco_crawler;
+
+-- 6) 클럽 경력 배치(career_job.py) 권한 — 2026-10 추가.
+--    player_career 는 바뀐 선수만 upsert, player_career_clubs(소속 필터 파생)는 바뀐 선수만
+--    DELETE 후 다시 INSERT 한다. clubs 는 클럽명→id 매칭용 읽기 전용.
+--    로그는 위 4번의 meta_crawl_log 권한을 그대로 쓴다.
+grant select, insert, update         on player.player_career       to fco_crawler;
+grant select, insert, update, delete on player.player_career_clubs to fco_crawler;
+grant select                         on player.clubs               to fco_crawler;

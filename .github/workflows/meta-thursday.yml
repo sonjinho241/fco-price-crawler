@@ -9,7 +9,10 @@ name: meta-thursday
 # 실패분)만 크롤하는 경량 단일 잡이다(신규 시즌 수백 장 = 수 분). 목요일 패치가
 # 기존 카드를 건드린 변경은 다음날 meta-friday.yml 풀크롤이 해시 diff 로 커버한다.
 #
-# 단계: sync(매시 폴링) → [감지 시에만] crawl(신규만) → notify(카톡 요약 1통).
+# crawl 잡 끝에서 처음 보는 선수(pid)의 클럽 경력도 바로 긁는다(career_job.py pending).
+# 기존 선수의 경력 변경은 다음날 meta-friday.yml 이 전량 비교로 커버한다.
+#
+# 단계: sync(매시 폴링) → [감지 시에만] crawl(신규만 + 신규 선수 경력) → notify(요약 1통).
 # 세 단계 모두 META_RUN_ID = github.run_id 로 묶여 meta_crawl_log 에서 집계된다.
 # workflow_dispatch 는 스모크 테스트용: 게이트를 무시하고 META_ONLY_NEW=0 + limit 으로
 # 파이프라인 전체(크롤→로그→알림)를 소량 검증한다.
@@ -83,6 +86,15 @@ jobs:
           META_ONLY_NEW: ${{ github.event_name == 'workflow_dispatch' && '0' || '1' }}
           META_LIMIT: ${{ github.event.inputs.limit || '0' }}
         run: python meta_crawler.py
+      # 방금 들어온 카드 중 player_career 에 없는 선수만. 앞 단계가 일부 실패해도
+      # 이미 들어간 선수는 처리한다(빠진 선수는 다음 실행이 다시 pending 으로 잡는다).
+      - name: Crawl club career of new players
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CAREER_MODE: pending
+          CAREER_LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: python career_job.py
 
   # ── 3) notify: crawl 이 실제로 돈 실행에서만 카카오톡 요약 1통 ──
   notify:
@@ -101,6 +113,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           EXPECTED_SHARDS: "1"
+          EXPECT_CAREER: "1"
           NOTIFY_LABEL: "목요일 신규"
           KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
