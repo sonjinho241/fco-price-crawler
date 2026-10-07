@@ -56,7 +56,8 @@ player.meta_crawl_log 에 적는다.
     META_ONLY_NEW           '1' 이면 crawl 대상을 crawled=FALSE 인 spid 로 한정 (기본 0)
     META_SEED_SEASON        seed-probe 모드에서 점검할 시즌 ID (예 879)
     META_SEED_DISABLE       '1' 이면 sync 의 데이터센터 시드를 끈다 (기본 0)
-    META_DETECT_GONE        '1' 이면 sync 가 spid.json 에서 빠진 spid 를 'gone' 로그로 남긴다
+    META_DETECT_GONE        '1' 이면 sync 가 spid.json 에서 빠진 spid 를 'gone' 로그로 남기고
+                            players.hidden 으로 앱 검색에서 뺀다. 돌아온 카드는 다시 띄운다
                             (금요일 풀크롤 전용, 기본 0)
 
 로컬 테스트:
@@ -624,8 +625,11 @@ def seed_probe() -> None:
 # 판정 = crawled=TRUE 이고, spid.json 에 없고, **그 시즌은 spid.json 에 있는** spid.
 #   · crawled=FALSE 는 방금 시드/sync 된 대기분이라 제외(목요일 크롤 몫).
 #   · 시즌째 빠졌으면 spid.json 갱신 지연(9/10 LKI2 처럼 하루 늦는 경우)일 수 있어 제외.
-# 행은 지우지 않는다(players 노출 여부는 별도 결정 사항). 넥슨이 되살리면 다음 sync 부터
-# 자동으로 다시 크롤 대상이 된다.
+# 행은 지우지 않고 players.hidden=TRUE 로 앱 검색에서만 뺀다(서버가 목록성 조회에서 거른다.
+# 상세·저장된 스쿼드 복원은 그대로 보인다). 넥슨이 되살리면 다음 금요일 sync 가 hidden 을
+# 풀고, 자동으로 다시 크롤 대상이 된다.
+# ⚠️ 그래서 hidden 은 이 판정이 소유한다 — spid.json 에 있는 카드를 손으로 숨겨도 금요일에
+#    풀린다. 다른 이유로 숨길 일이 생기면 별도 컬럼을 둘 것.
 _ALL_CRAWLED_SPIDS_SQL = text(f"""
     SELECT spid, crawled_at FROM {PLAYER_SCHEMA}.spid WHERE crawled = TRUE
 """)
@@ -633,6 +637,25 @@ _ALL_CRAWLED_SPIDS_SQL = text(f"""
 # 이 기간 안에 정상 크롤된 적이 있으면 "이번 주에 새로 사라진" 카드로 본다(알림용).
 # 금요일 풀크롤 주기 7일 + cron 지연 여유 1일.
 _GONE_FRESH_DAYS = 8
+
+# 한 번에 이보다 많이 사라졌으면 넥슨이 카드를 내린 게 아니라 spid.json 이 잘려 온 것으로
+# 본다. 그때는 숨기지 않는다 — 크롤 제외는 다음 주에 저절로 풀리지만, 대량 숨김은 앱 검색을
+# 통째로 비운다. 지금까지 실제로 내려간 카드는 한 번에 5장이었다.
+_GONE_HIDE_MAX = 100
+
+_HIDE_SPIDS_SQL = text(f"""
+    UPDATE {PLAYER_SCHEMA}.players SET hidden = TRUE
+    WHERE spid = ANY(CAST(:spids AS bigint[])) AND hidden = FALSE
+""")
+
+_HIDDEN_SPIDS_SQL = text(f"""
+    SELECT spid FROM {PLAYER_SCHEMA}.players WHERE hidden = TRUE
+""")
+
+_UNHIDE_SPIDS_SQL = text(f"""
+    UPDATE {PLAYER_SCHEMA}.players SET hidden = FALSE
+    WHERE spid = ANY(CAST(:spids AS bigint[])) AND hidden = TRUE
+""")
 
 
 def _log_gone_spids(engine, run_id: str, player_data: list) -> None:
@@ -652,6 +675,25 @@ def _log_gone_spids(engine, run_id: str, player_data: list) -> None:
                 newly_gone.append(r.spid)
         gone.sort()
         newly_gone.sort()
+
+        # 앱 검색에서 빼고, spid.json 에 돌아온 카드는 다시 띄운다. 숨긴 카드는 몇 장뿐이라
+        # 되살아남 판정은 파이썬에서 한다(8.8만 spid 를 배열로 넘기지 않는다).
+        hidden_now = 0
+        if len(gone) > _GONE_HIDE_MAX:
+            logger.warning(
+                "사라진 spid 가 %d개로 상한(%d)을 넘어 숨기지 않습니다 — spid.json 이 잘려 왔는지 확인",
+                len(gone), _GONE_HIDE_MAX,
+            )
+        elif gone:
+            hidden_now = conn.execute(
+                _HIDE_SPIDS_SQL, {"spids": _pg_array_literal(gone)}
+            ).rowcount
+        revived = sorted(
+            r.spid for r in conn.execute(_HIDDEN_SPIDS_SQL) if r.spid in listed
+        )
+        if revived:
+            conn.execute(_UNHIDE_SPIDS_SQL, {"spids": _pg_array_literal(revived)})
+
         conn.execute(
             text(f"""
                 INSERT INTO {PLAYER_SCHEMA}.meta_crawl_log
@@ -661,11 +703,14 @@ def _log_gone_spids(engine, run_id: str, player_data: list) -> None:
             {
                 "rid": run_id,
                 "n": len(newly_gone),
-                "detail": json.dumps({"gone": gone, "newly_gone": newly_gone}),
+                "detail": json.dumps(
+                    {"gone": gone, "newly_gone": newly_gone, "revived": revived}
+                ),
             },
         )
         conn.commit()
     logger.info("넥슨에서 사라진 spid=%d (이번 주 신규 %d): %s", len(gone), len(newly_gone), gone[:20])
+    logger.info("앱 검색에서 새로 숨김 %d장, 되살아나 다시 노출 %d장: %s", hidden_now, len(revived), revived[:20])
 
 
 _GONE_SPIDS_SQL = text(f"""
