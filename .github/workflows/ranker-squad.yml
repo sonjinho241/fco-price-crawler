@@ -1,14 +1,15 @@
 name: ranker-squad
 
-# 공식경기 1 ON 1 랭킹 1만명의 대표팀 스쿼드(선발 11명)를 모아
+# 공식경기 1 ON 1 랭킹 1만명이 최근 공식경기에 실제로 낸 선발 11명을 모아
 # "팀컬러 × 포지션 × 선수" 교차표를 만든다(ranker_squad_job.py).
 #
 # 주 1회면 충분하다 — 랭킹 1만명의 구성이 하루 만에 뒤집히지 않고, 요청 수가
-# 적지 않다(랭킹 500 + 랭커당 1~3건). 라이브 퍼포먼스가 반영되는 금요일 11:00 KST
+# 적지 않다(랭킹 500 + 넥슨 Open API 랭커당 2~3건). 라이브 퍼포먼스가 반영되는 금요일 11:00 KST
 # 이후, 그리고 유저들이 새 메타로 스쿼드를 바꿀 시간을 준 **일요일 새벽**에 돈다.
 #
 # ⚠️ 샤딩하지 않는다. 한 프로세스가 스레드 workers 개로 도는 게 전부다(넥슨 쪽에
-#    부담을 몰아주지 않으려는 의도). 1만명 기준 ~40분.
+#    부담을 몰아주지 않으려는 의도). 1만명 기준 첫 회차 ~40분, ouid 캐시 뒤 ~30분.
+# ⚠️ 호출량 초과가 재시도로도 안 풀리면 저장하지 않고 실패로 끝난다(반쪽 회차 방지).
 #
 # 넥슨 고지: 크롤링 데이터는 30일 내 갱신 의무. 주 1회면 충족한다.
 
@@ -24,9 +25,10 @@ on:
       workers:
         description: "동시 요청 스레드 수"
         required: false
-        default: "8"
+        default: "4"
 
-# 🔒 시크릿(DATABASE_URL)은 코드에 두지 않는다. pull_request 트리거 금지.
+# 🔒 시크릿(DATABASE_URL, NEXON_OPEN_API_KEY)은 코드에 두지 않는다. 이 저장소는 PUBLIC 이다.
+#    pull_request 트리거 금지(포크 PR 이 시크릿에 닿을 수 있다).
 permissions:
   contents: read
 
@@ -48,6 +50,7 @@ jobs:
       - name: Collect ranker squads
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NEXON_OPEN_API_KEY: ${{ secrets.NEXON_OPEN_API_KEY }}
           RANKER_SQUAD_LIMIT: ${{ github.event.inputs.limit || '0' }}
-          RANKER_SQUAD_WORKERS: ${{ github.event.inputs.workers || '8' }}
+          RANKER_SQUAD_WORKERS: ${{ github.event.inputs.workers || '4' }}
         run: python ranker_squad_job.py

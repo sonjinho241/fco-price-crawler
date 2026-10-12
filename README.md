@@ -102,24 +102,28 @@ DB의 `player.player_price_latest` 테이블에 upsert 한다. 이 표 덕분에
 
 ## 🤖 운영 요약 — 랭커 스쿼드 배치(`ranker_squad_job.py`)
 
-공식경기 1 ON 1 랭킹 **1만명의 대표팀 선발 11명**을 모아 "팀컬러 × 포지션 × 선수" 교차표를
-만든다. 넥슨은 팀컬러 순위와 포지션별 선수 순위를 각각 별개 표로만 주고 이 교차표는 안 준다.
+공식경기 1 ON 1 랭킹 **1만명이 최근 공식경기에 실제로 낸 선발 11명**을 모아 "팀컬러 × 포지션 × 선수"
+교차표를 만든다. 넥슨은 팀컬러 순위와 포지션별 선수 순위를 각각 별개 표로만 주고 이 교차표는 안 준다.
 
-- **언제**: `ranker-squad.yml`, 일 04:00 KST 주 1회. 샤딩 없음(단일 잡, 스레드 8개, ~30분).
+- **언제**: `ranker-squad.yml`, 일 04:00 KST 주 1회(GitHub cron 지연으로 실제 시작은 07시 무렵).
+  샤딩 없음(단일 잡, 스레드 4개, ~30~40분). 회차 날짜(`collected_on`)는 **KST 기준**이다
+  (2026-10-10 회차까지는 UTC 날짜라 토요일로 찍혔다).
 - **무엇을 넣나**: `player.ranker_squad_snapshot`(원본, 랭커×11행) →
   `player.team_color_player_usage`(집계). 회차 로그는 `player.ranker_squad_run`.
-  스키마·권한은 `sql/ranker_squad.sql` (실제 DB 에도 GRANT 해야 한다).
-- **경로**(모두 로그인 불필요):
-  `GET /datacenter/rank_inner?rt=1vs1&n4seasonno=0&n4pageno=N` (20행, 500페이지)
-  → `GET /profile/squad/popup/{sn}` (characterId)
-  → `GET /datacenter/SquadGetUserInfo?strTeamType=1&n1Type={1,2,3}&n8NexonSN=&strCharacterID=`
-- ⚠️ **`X-Requested-With: XMLHttpRequest` 없으면 `SquadGetUserInfo` 는 302.** 쿠키는 불필요.
-- ⚠️ 강화단계는 `players[].buildUp`. `lv` 는 빈 문자열이다.
-- ⚠️ 팀컬러 판정은 `totalTeamColor.affiliation` 에 넥슨이 넣어준 걸 그대로 쓴다. 단 넥슨의
-  팀컬러 번호는 우리 `team_colors.id` 와 체계가 달라 **이름으로 매칭**한다.
-- **어느 스쿼드를 쓰나**: 랭킹 표의 팀컬러(= 랭크에서 실제 쓴 덱)와 **이름이 일치하는**
-  대표팀 스쿼드만 채택한다. 대표 스쿼드부터 보고 아니면 A/B/C 를 훑고, 끝내 없으면 버린다
-  (매칭률 ~91%). "그냥 대표 스쿼드 쓰자"로 바꾸면 통계의 의미가 달라지니 주의.
+  ouid 캐시는 `player.ranker_ouid`. 스키마·권한은 `sql/ranker_squad.sql` (실제 DB 에도 GRANT 해야 한다).
+- **시크릿**: `DATABASE_URL`, `NEXON_OPEN_API_KEY` (repo Settings → Secrets → Actions).
+  🔒 이 저장소는 PUBLIC 이다. 키는 헤더로만 보내고 로그·예외·덤프에 남기지 않는다.
+- **경로**:
+  `GET fconline.nexon.com/datacenter/rank_inner?rt=1vs1&n4seasonno=0&n4pageno=N` (20행, 500페이지, 키 불필요)
+  → Open API `GET /fconline/v1/id?nickname=` (ouid, 캐시되면 생략)
+  → `GET /fconline/v1/user/match?ouid=&matchtype=50&limit=3`
+  → `GET /fconline/v1/match-detail?matchid=` 의 내 쪽 `player[]` (`spPosition` 28 = 교체, `spGrade` = 강화단계)
+  선수 이름은 `static/fconline/meta/spid.json` 1회.
+- **어느 스쿼드를 쓰나**: 랭킹 표의 팀컬러(= 그 경기의 덱) + **가장 최근 공식경기의 출전 명단**.
+  2026-10-12 전까지는 프로필 대표팀 A/B/C 저장 스쿼드 중 팀컬러 이름이 맞는 것을 골랐고
+  (매칭률 ~91%, `squad_slot` 1~3), 지금은 경기 명단이라 `squad_slot` = 0, 매칭률 ~99%.
+- ⚠️ 호출량 초과(429 / `OPENAPI00007`)가 재시도로 안 풀리거나 오류가 20%를 넘으면 **저장하지 않고**
+  실패로 끝난다. 앱은 지난 회차를 계속 보여준다.
 - **DB 없이 확인**: `RANKER_SQUAD_LIMIT=60 python ranker_squad_job.py --out s.json --report`
   이미 뜬 덤프로 표만 다시: `python ranker_squad_job.py --from-json s.json --report "첼시"`
 

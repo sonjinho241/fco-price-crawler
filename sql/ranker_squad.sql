@@ -16,14 +16,14 @@ create table if not exists player.ranker_squad_run (
 );
 
 -- 2) 원본 스냅샷 — 랭커 1명 × 선발 11명 = 11행 ------------------------------
---    랭킹 표의 팀컬러와 일치한 대표팀 스쿼드만 들어온다(= 랭크에서 실제로 쓴 덱).
+--    랭커가 가장 최근 공식경기에 실제로 내보낸 선발 명단(넥슨 Open API match-detail).
 --    후보 7명은 저장하지 않는다.
 create table if not exists player.ranker_squad_snapshot (
     collected_on    date        not null,
     nexon_sn        bigint      not null,
     rank            integer     not null,
     team_color_name text        not null,
-    squad_slot      smallint    not null,   -- 대표팀 A/B/C = 1/2/3
+    squad_slot      smallint    not null,   -- 0 = 최근 공식경기 출전 명단(2026-10-12~). 그 전 회차는 대표팀 A/B/C = 1/2/3
     slot_index      smallint    not null,   -- 스쿼드 안 순번 0..10
     slot_role       text        not null,   -- 포메이션 슬롯 원문(ls, rcb, ...). 빈 값이 올 수 있어 키로 못 쓴다
     position_group  text        not null,   -- FW/CAM/WING/CM/CDM/CB/FB/GK
@@ -55,12 +55,19 @@ create table if not exists player.team_color_player_usage (
 create index if not exists ix_team_color_player_usage_lookup
     on player.team_color_player_usage (collected_on, team_color_id, position_group, user_cnt desc);
 
--- 4) characterId 캐시 -------------------------------------------------------
---    SquadGetUserInfo 는 characterId 가 있어야 답한다. 이 값은 계정마다 고정이라
---    한 번 받아두면 다음 회차엔 popup 요청(랭커당 1건, gzip 9KB)을 통째로 건너뛴다.
+-- 4) characterId 캐시 (2026-10-12 Open API 전환 뒤로 안 쓴다. 지난 회차 재현용으로 남겨둔다)
 create table if not exists player.ranker_character_id (
     nexon_sn     bigint      primary key,
     character_id text        not null,
+    updated_at   timestamptz not null default now()
+);
+
+-- 4-1) ouid 캐시 ------------------------------------------------------------
+--    Open API 의 ouid 는 계정마다 고정이라 한 번 받아두면 다음 회차엔 랭커당
+--    /id 요청 1건(1만 건)을 통째로 건너뛴다.
+create table if not exists player.ranker_ouid (
+    nexon_sn     bigint      primary key,
+    ouid         text        not null,
     updated_at   timestamptz not null default now()
 );
 
@@ -70,4 +77,5 @@ grant select, insert, update, delete on player.ranker_squad_snapshot   to fco_cr
 grant select, insert, update, delete on player.team_color_player_usage to fco_crawler;
 grant select, insert, update         on player.ranker_squad_run        to fco_crawler;
 grant select, insert, update         on player.ranker_character_id     to fco_crawler;
+grant select, insert, update         on player.ranker_ouid             to fco_crawler;
 grant select                         on player.team_colors             to fco_crawler;

@@ -1,57 +1,55 @@
 """
 FC Online 랭커 스쿼드 크롤러 — "팀컬러별 포지션별 인기 선수" 교차표용 자기완결형 스크립트.
 
-공식경기 1 ON 1 랭킹 상위 10,000명의 **대표팀 스쿼드 선발 11명**을 모아
-(팀컬러 × 포지션 × 선수) 교차표의 원재료를 만든다. 넥슨은 팀컬러 순위와
+공식경기 1 ON 1 랭킹 상위 10,000명이 **가장 최근 공식경기에 실제로 내보낸 선발 11명**을
+모아 (팀컬러 × 포지션 × 선수) 교차표의 원재료를 만든다. 넥슨은 팀컬러 순위와
 포지션별 선수 순위를 각각 별개 표로만 주고 이 교차표는 주지 않는다.
 
 이 파일 하나로 끝난다(메인 비공개 앱 저장소에 의존하지 않는다).
 
-⚠️ 비밀정보(DATABASE_URL)는 절대 이 파일/저장소에 두지 않는다.
-   GitHub repo Settings → Secrets and variables → Actions → DATABASE_URL 로만 주입한다.
+⚠️ 비밀정보(DATABASE_URL, NEXON_OPEN_API_KEY)는 절대 이 파일/저장소에 두지 않는다.
+   이 저장소는 PUBLIC 이다. GitHub repo Settings → Secrets and variables → Actions
+   로만 주입한다. 키는 요청 헤더로만 보내고 로그·예외 메시지·덤프에 남기지 않는다.
 
 
-넥슨 엔드포인트 (2026-09-17 실측, 모두 로그인 불필요)
+넥슨 엔드포인트 (2026-10-12 실측)
 --------------------------------------------------------------------------
-1) 랭커 목록  GET /datacenter/rank_inner?rt=1vs1&n4seasonno=0&n4pageno={1..500}
+1) 랭커 목록  GET fconline.nexon.com/datacenter/rank_inner?rt=1vs1&n4seasonno=0&n4pageno={1..500}
+   (로그인·키 불필요. Open API 에는 랭킹 목록이 없어서 이것만은 데이터센터를 긁는다.)
    20행/페이지, 500페이지에서 정확히 10,000명(501은 500을 그대로 되돌려준다).
    행마다 순위 · 구단주명 · data-sn(넥슨SN) · **팀컬러 이름+인원수** · 포메이션.
    여기의 팀컬러가 "그 랭커가 랭크 경기에서 실제로 쓴 덱"이다.
 
-2) 캐릭터 ID  GET /profile/squad/popup/{nexon_sn}
-   HTML 안의 SetSquadInfo("<teamType>", "<squad>", "<sn>", "<characterId>") 에서
-   characterId(24 hex)와 그 유저의 "대표 스쿼드" 좌표를 얻는다.
+2) 넥슨 Open API (헤더 x-nxopen-api-key)
+   GET /fconline/v1/id?nickname=          → {"ouid"}   (없는 닉네임은 400 + OPENAPI00004)
+   GET /fconline/v1/user/match?ouid=&matchtype=50&offset=0&limit=N → matchid 배열(최근 순)
+   GET /fconline/v1/match-detail?matchid= → matchInfo[] 중 ouid 가 같은 쪽의 player[]
+       spId(9자리) · spPosition(0..27 = 포메이션 자리, 28 = 교체) · spGrade(=강화단계)
+   ouid 는 계정마다 고정이라 nexon_sn → ouid 를 캐시해두면 다음 회차엔 랭커당 2건이다.
 
-3) 스쿼드     GET /datacenter/SquadGetUserInfo
-              ?strTeamType={1=대표팀,0=클럽팀}&n1Type={1,2,3 = A,B,C 스쿼드}
-              &n8NexonSN={sn}&strCharacterID={cid}
-   → JSON. **X-Requested-With: XMLHttpRequest 헤더가 없으면 302로 튕긴다.**
-   쿠키는 필요 없다(cid 만 맞으면 된다).
-
-   players[] 18명 중 state==0 이 선발 11명, state==1 이 후보 7명.
-   쓰는 필드: spid(9자리) · buildUp(=강화단계) · role(포메이션 슬롯) · name.
-   totalTeamColor.affiliation 에 **넥슨이 직접 판정한 소속 팀컬러**가 들어있다
-   (우리가 요구인원/카테고리 규칙을 역산할 필요가 없다).
+3) 선수 이름  GET open.api.nexon.com/static/fconline/meta/spid.json (키 불필요, 1회)
 
 
 어느 스쿼드를 쓰는가 (중요)
 --------------------------------------------------------------------------
-유저는 대표팀 A/B/C 3개를 저장해두고, 랭크에서 그중 무엇을 썼는지는 프로필에
-표시되지 않는다. 게다가 경기 후 스쿼드를 바꾼 유저는 A/B/C 어디에도 그 덱이 없다
-(2026-09-17 표본 13명 중 3명이 불일치, 그중 1명은 A/B/C 전부 불일치).
+예전에는 프로필의 대표팀 A/B/C 저장 스쿼드를 긁어 랭킹 표의 팀컬러와 이름이 맞는
+것을 골랐다. 하지만 랭크에서 무엇을 썼는지는 프로필에 안 나오고, 경기 후 스쿼드를
+바꾼 유저는 A/B/C 어디에도 그 덱이 없어 ~9%를 버려야 했다.
 
-그래서 **랭킹 표의 팀컬러 이름과 일치하는 스쿼드만 채택**한다:
-  대표 스쿼드 먼저 확인 → 불일치하면 대표팀 A/B/C 를 훑어 일치하는 것 채택
-  → 끝내 없으면 그 랭커는 버린다(unresolved 로 집계만 남긴다).
-이렇게 해야 "랭크에서 실제로 쓴 덱"이라는 말이 정확해진다.
+지금은 **가장 최근 공식경기(matchtype 50)의 출전 명단**을 그대로 쓴다. 랭킹 표의
+팀컬러는 경기 시점 값이므로 같은 경기의 덱이다. 2026-10-12 상위 20명 표본에서
+저장 스쿼드 방식과 선발 11명이 완전히 같은 경우가 17명, 저장 스쿼드로는 못 찾던
+1명은 경기 명단으로 잡혔고, 나머지 2명은 저장 스쿼드와 경기 명단이 7·10명만 겹쳤다
+(실전에서 바꿔 낸 선수 — 경기 명단 쪽이 정답이다).
 
 
 환경변수
+    NEXON_OPEN_API_KEY          (필수) 넥슨 Open API 키.
     DATABASE_URL                (선택) 없으면 DB 에 쓰지 않고 --out 으로만 덤프한다.
     RANKER_SQUAD_LIMIT          처리할 랭커 수 상한 (기본 0=전체 10,000)
-    RANKER_SQUAD_WORKERS        동시 요청 스레드 수 (기본 6)
-    RANKER_SQUAD_REQUEST_DELAY  각 요청 후 sleep 초 (기본 0.15)
-    RANKER_SQUAD_MAX_RETRIES    넥슨 호출 재시도 횟수 (기본 3)
+    RANKER_SQUAD_WORKERS        동시 요청 스레드 수 (기본 4)
+    RANKER_SQUAD_REQUEST_DELAY  각 요청 후 sleep 초 (기본 0.1)
+    RANKER_SQUAD_MAX_RETRIES    넥슨 호출 재시도 횟수 (기본 4)
     RANKER_SQUAD_DB_BATCH       DB 에 한 번에 쓰는 행 수 (기본 2000)
 
 로컬 테스트(DB 없이):
@@ -69,7 +67,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
@@ -82,19 +80,41 @@ PLAYER_SCHEMA = "player"
 
 BASE = "https://fconline.nexon.com"
 RANK_INNER_URL = f"{BASE}/datacenter/rank_inner"
-SQUAD_POPUP_URL = f"{BASE}/profile/squad/popup"
-SQUAD_INFO_URL = f"{BASE}/datacenter/SquadGetUserInfo"
+
+OPEN_API_BASE = "https://open.api.nexon.com/fconline/v1"
+SPID_META_URL = "https://open.api.nexon.com/static/fconline/meta/spid.json"
 
 # 랭킹은 최대 10,000명(=500페이지)만 제공된다. 501페이지는 500과 같은 내용이 온다.
 RANK_PAGE_SIZE = 20
 RANK_MAX_PAGE = 500
 
-# 대표팀. 클럽팀(0)은 이 통계의 대상이 아니다.
-TEAM_TYPE_NATIONAL = 1
-# 대표팀 A / B / C 스쿼드.
-SQUAD_SLOTS = (1, 2, 3)
+# 공식경기. 랭킹 표(rt=1vs1)가 이 경기 결과로 매겨진다.
+MATCH_TYPE_OFFICIAL = 50
+# 최근 경기 몇 개까지 훑을지. 첫 경기에 선발 11명이 다 없으면(기권 등) 다음 것을 본다.
+RECENT_MATCHES = 3
+# 스냅샷의 squad_slot. 예전 저장 스쿼드 방식은 대표팀 A/B/C = 1/2/3 이었다.
+SQUAD_SLOT_MATCH = 0
 
-STATE_STARTER = 0
+SP_POSITION_SUB = 28
+# static/fconline/meta/spposition.json (2026-10-12). 슬롯 이름은 예전 저장 스쿼드의
+# role 과 같은 체계라 아래 포지션 그룹 표를 그대로 쓴다.
+SP_POSITION_ROLES = {
+    0: "gk", 1: "sw", 2: "rwb", 3: "rb", 4: "rcb", 5: "cb", 6: "lcb", 7: "lb",
+    8: "lwb", 9: "rdm", 10: "cdm", 11: "ldm", 12: "rm", 13: "rcm", 14: "cm",
+    15: "lcm", 16: "lm", 17: "ram", 18: "cam", 19: "lam", 20: "rf", 21: "cf",
+    22: "lf", 23: "rw", 24: "rs", 25: "st", 26: "ls", 27: "lw",
+}
+
+NICKNAME_NOT_FOUND = "OPENAPI00004"
+RATE_LIMITED = "OPENAPI00007"
+
+KST = timezone(timedelta(hours=9))
+
+
+def today_kst() -> date:
+    """회차 날짜. GitHub 러너는 UTC 라 date.today() 를 쓰면 일요일 새벽(KST) 실행이
+    토요일로 찍힌다(2026-10-11 회차가 10-10 으로 저장됐다)."""
+    return datetime.now(KST).date()
 
 
 # =============================================================================
@@ -112,9 +132,6 @@ _RANK_ROW_RE = re.compile(
 # 있어서 선택 그룹이라 non-greedy 가 멈추지 않는다). 둘을 따로 뽑는다.
 _RANK_TC_NAME_RE = re.compile(r'class="inner">\s*([^<]*)')
 _RANK_TC_COUNT_RE = re.compile(r"<small>\((\d+)명\)")
-_SET_SQUAD_INFO_RE = re.compile(
-    r'SetSquadInfo\(\s*"(\d+)"\s*,\s*"(\d+)"\s*,\s*"(\d+)"\s*,\s*"([0-9a-f]+)"'
-)
 
 
 class RankRow:
@@ -157,15 +174,6 @@ def parse_rank_page(markup: str) -> List[RankRow]:
             )
         )
     return rows
-
-
-def parse_character_id(markup: str) -> Optional[Tuple[int, int, str]]:
-    """popup HTML → (기본 teamType, 기본 squad, characterId). 없으면 None."""
-    m = _SET_SQUAD_INFO_RE.search(markup)
-    if not m:
-        return None
-    team_type, squad, _sn, cid = m.groups()
-    return int(team_type), int(squad), cid
 
 
 # 포메이션 슬롯(role) → 집계용 포지션 그룹 8종.
@@ -212,40 +220,31 @@ def normalize_role(role: str) -> str:
     return _ROLE_TO_GROUP.get(key, key.upper())
 
 
-def affiliation_team_colors(squad: dict) -> List[Tuple[str, int]]:
-    """스쿼드 JSON 에서 넥슨이 판정한 '소속' 팀컬러 [(이름, 적용 인원), ...]."""
-    total = squad.get("totalTeamColor") or {}
-    affiliation = total.get("affiliation") or {}
-    out = []
-    for value in affiliation.values():
-        name = (value.get("name") or "").strip()
-        if name:
-            out.append((name, int(value.get("playercnt") or 0)))
-    out.sort(key=lambda item: -item[1])
-    return out
+def match_starters(match_info: dict, names: Dict[int, str]) -> List[dict]:
+    """match-detail 의 내 쪽 matchInfo → 선발 11명. 교체(spPosition 28)는 버린다."""
+    picked = []
+    for player in match_info.get("player") or []:
+        position = player.get("spPosition")
+        spid = player.get("spId")
+        if position is None or position == SP_POSITION_SUB or not spid:
+            continue
+        picked.append((int(position), int(spid), int(player.get("spGrade") or 0)))
+    # 응답 순서는 보장되지 않으므로 자리 번호(GK → 최전방)로 정렬해 순번을 매긴다.
+    picked.sort()
 
-
-def starters(squad: dict) -> List[dict]:
-    """선발 11명만. 후보(state==1)는 이 통계에서 쓰지 않으므로 아예 버린다."""
     rows = []
-    for player in squad.get("players") or []:
-        if int(player.get("state", -1)) != STATE_STARTER:
-            continue
-        spid = player.get("spid")
-        if not spid:
-            continue
-        role = (player.get("role") or "").strip().lower()
+    for position, spid, grade in picked:
+        role = SP_POSITION_ROLES.get(position, "")
         rows.append(
             {
                 # slot_index 는 스쿼드 안 순번(0..10)이다. slot_role 은 키로 못 쓴다 —
-                # role 이 빈 문자열인 스쿼드가 실제로 있어서(1만명 중 1건) 한 스쿼드에
-                # 같은 값이 두 번 나오면 PK 가 충돌한다.
+                # 모르는 자리 번호가 오면 빈 문자열이 두 번 나와 PK 가 충돌한다.
                 "slot_index": len(rows),
-                "spid": int(spid),
-                "build_up": int(player.get("buildUp") or 0),
+                "spid": spid,
+                "build_up": grade,
                 "slot_role": role,
                 "position": normalize_role(role),
-                "player_name": (player.get("name") or "").strip(),
+                "player_name": names.get(spid, ""),
             }
         )
     return rows
@@ -255,7 +254,7 @@ def starters(squad: dict) -> List[dict]:
 # HTTP
 # =============================================================================
 class Nexon:
-    """넥슨 호출 담당. 스레드마다 별도 세션을 쓴다(requests.Session 은 스레드 공유 비권장)."""
+    """데이터센터(랭킹 표) 호출 담당. 스레드마다 별도 세션을 쓴다(requests.Session 은 스레드 공유 비권장)."""
 
     def __init__(self, delay: float, max_retries: int, timeout: int = 20):
         self.delay = delay
@@ -268,8 +267,6 @@ class Nexon:
         session = getattr(self._local, "session", None)
         if session is None:
             session = requests.Session()
-            # Accept-Encoding: gzip 이 핵심이다. 스쿼드 JSON 은 원문 80KB 인데
-            # gzip 으로 12.5KB 로 줄어든다(10,000명이면 800MB → 125MB).
             session.headers.update(
                 {"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip, deflate"}
             )
@@ -279,7 +276,6 @@ class Nexon:
     def get(self, url: str, params=None, *, xhr: bool = False, referer: str = None) -> str:
         headers = {}
         if xhr:
-            # ⚠️ 이 헤더가 없으면 SquadGetUserInfo 는 302 로 튕긴다.
             headers["X-Requested-With"] = "XMLHttpRequest"
         if referer:
             headers["Referer"] = referer
@@ -316,29 +312,115 @@ class Nexon:
         )
         return parse_rank_page(markup)
 
-    def character_id(self, nexon_sn: int) -> Optional[Tuple[int, int, str]]:
-        markup = self.get(f"{SQUAD_POPUP_URL}/{nexon_sn}")
-        return parse_character_id(markup)
 
-    def squad(self, nexon_sn: int, character_id: str, team_type: int, slot: int) -> Optional[dict]:
-        body = self.get(
-            SQUAD_INFO_URL,
-            params={
-                "strTeamType": team_type,
-                "n1Type": slot,
-                "n8NexonSN": nexon_sn,
-                "strCharacterID": character_id,
-            },
-            xhr=True,
-            referer=f"{SQUAD_POPUP_URL}/{nexon_sn}",
+class QuotaExceeded(RuntimeError):
+    """재시도해도 호출량 초과가 풀리지 않았다. 반쪽 회차를 쓰지 않도록 배치 전체를 멈춘다."""
+
+
+class OpenApi:
+    """넥슨 Open API 호출 담당.
+
+    ⚠️ 키는 헤더로만 보낸다. 예외 메시지에는 경로와 상태 코드만 담고 URL·헤더·응답
+    원문을 넣지 않는다(이 저장소와 Actions 로그는 공개다).
+    """
+
+    def __init__(self, api_key: str, delay: float, max_retries: int, timeout: int = 15):
+        if not api_key:
+            raise ValueError("NEXON_OPEN_API_KEY 가 설정되지 않았습니다.")
+        self._api_key = api_key
+        self.delay = delay
+        self.max_retries = max_retries
+        self.timeout = timeout
+        self._local = threading.local()
+        self.calls = 0
+        self._calls_lock = threading.Lock()
+
+    def __repr__(self):
+        return "OpenApi(<key hidden>)"
+
+    @property
+    def session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update(
+                {"x-nxopen-api-key": self._api_key, "Accept-Encoding": "gzip, deflate"}
+            )
+            self._local.session = session
+        return session
+
+    def _get(self, path: str, params: dict):
+        """(status, body). 400 의 넥슨 오류 이름은 호출부가 판단하도록 body 로 돌려준다."""
+        last = None
+        for attempt in range(self.max_retries):
+            with self._calls_lock:
+                self.calls += 1
+            try:
+                res = self.session.get(OPEN_API_BASE + path, params=params, timeout=self.timeout)
+            except requests.RequestException as exc:
+                # 예외 문자열에 쿼리스트링(닉네임)이 들어갈 수 있어 종류만 남긴다.
+                last = type(exc).__name__
+            else:
+                body = _json_or_none(res)
+                name = _error_name(body)
+                if res.status_code == 429 or name == RATE_LIMITED:
+                    last = "rate limited"
+                    if attempt == self.max_retries - 1:
+                        raise QuotaExceeded(f"{path} 호출량 초과가 풀리지 않습니다.")
+                    time.sleep(5.0 * (attempt + 1) + random.random())
+                    continue
+                if res.status_code >= 500:
+                    last = f"HTTP {res.status_code}"
+                else:
+                    if self.delay:
+                        time.sleep(self.delay)
+                    return res.status_code, body
+            if attempt < self.max_retries - 1:
+                time.sleep((2.0 ** attempt) + random.random())
+        raise RuntimeError(f"{path} 호출 실패: {last}")
+
+    def ouid(self, nickname: str) -> Optional[str]:
+        status, body = self._get("/id", {"nickname": nickname})
+        if status == 400 and _error_name(body) == NICKNAME_NOT_FOUND:
+            return None
+        if status != 200 or not isinstance(body, dict):
+            raise RuntimeError(f"/id HTTP {status}")
+        return body.get("ouid")
+
+    def recent_matches(self, ouid: str, limit: int) -> List[str]:
+        status, body = self._get(
+            "/user/match",
+            {"ouid": ouid, "matchtype": MATCH_TYPE_OFFICIAL, "offset": 0, "limit": limit},
         )
-        body = body.strip()
-        if not body:
-            return None
-        try:
-            return json.loads(body)
-        except json.JSONDecodeError:
-            return None
+        if status != 200:
+            raise RuntimeError(f"/user/match HTTP {status}")
+        return [str(item) for item in body] if isinstance(body, list) else []
+
+    def match_detail(self, match_id: str) -> Optional[dict]:
+        status, body = self._get("/match-detail", {"matchid": match_id})
+        if status != 200:
+            raise RuntimeError(f"/match-detail HTTP {status}")
+        return body if isinstance(body, dict) else None
+
+
+def _json_or_none(res: requests.Response):
+    try:
+        return res.json()
+    except ValueError:
+        return None
+
+
+def _error_name(body) -> Optional[str]:
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        return body["error"].get("name")
+    return None
+
+
+def fetch_player_names() -> Dict[int, str]:
+    """spid → 선수 이름. 앱이 스냅샷의 player_name 으로 이름을 보여준다."""
+    res = requests.get(SPID_META_URL, timeout=60, headers={"Accept-Encoding": "gzip"})
+    res.raise_for_status()
+    return {int(item["id"]): (item.get("name") or "").strip() for item in res.json()}
 
 
 # =============================================================================
@@ -373,70 +455,66 @@ def fetch_rank_rows(nexon: Nexon, limit: int = 0) -> List[RankRow]:
 class Resolution:
     """랭커 1명의 처리 결과."""
 
-    __slots__ = ("row", "status", "team_type", "slot", "matched_count", "players",
-                 "probes", "character_id")
+    __slots__ = ("row", "status", "slot", "players", "ouid", "match_id")
 
-    def __init__(self, row, status, team_type=None, slot=None, matched_count=None,
-                 players=None, probes=0, character_id=None):
+    def __init__(self, row, status, slot=None, players=None, ouid=None, match_id=None):
         self.row = row
-        self.status = status  # matched | unresolved | no_team_color | no_character_id | error
-        self.team_type = team_type
+        # matched | no_team_color | no_ouid | no_match | unresolved | error
+        self.status = status
         self.slot = slot
-        self.matched_count = matched_count
         self.players = players or []
-        self.probes = probes
-        self.character_id = character_id
+        self.ouid = ouid
+        self.match_id = match_id
 
 
-def resolve_ranker(nexon: Nexon, row: RankRow, character_id: Optional[str] = None) -> Resolution:
-    """랭킹 표의 팀컬러와 일치하는 대표팀 스쿼드를 찾아 선발 11명을 돌려준다.
+# 랭킹 표에 잡혔지만 덱을 못 얻은 상태들. 회차 로그의 unresolved_cnt 로 묶는다.
+UNRESOLVED_STATUSES = ("no_ouid", "no_match", "unresolved")
 
-    character_id 를 넘기면 popup 요청을 건너뛴다(이전 회차에 캐시해둔 값).
+
+def resolve_ranker(api: OpenApi, row: RankRow, names: Dict[int, str],
+                   ouid: Optional[str] = None) -> Resolution:
+    """랭커의 가장 최근 공식경기 출전 명단에서 선발 11명을 돌려준다.
+
+    ouid 를 넘기면 /id 요청을 건너뛴다(이전 회차에 캐시해둔 값).
     """
     if not row.team_color_name:
         # 팀컬러가 적용되지 않은 스쿼드는 교차표의 축이 없으므로 대상이 아니다.
         return Resolution(row, "no_team_color")
 
-    default_slot = None
-    if character_id is None:
-        info = nexon.character_id(row.nexon_sn)
-        if not info:
-            return Resolution(row, "no_character_id")
-        _default_team_type, default_slot, character_id = info
+    if ouid is None:
+        ouid = api.ouid(row.nickname)
+        if not ouid:
+            # 랭킹 표의 닉네임이 그새 바뀌었다(다음 회차엔 새 닉네임으로 잡힌다).
+            return Resolution(row, "no_ouid")
 
-    # 대표 스쿼드를 먼저 본다(표본상 4명 중 3명은 여기서 끝난다).
-    order = [default_slot] if default_slot in SQUAD_SLOTS else []
-    order += [slot for slot in SQUAD_SLOTS if slot != default_slot]
+    match_ids = api.recent_matches(ouid, RECENT_MATCHES)
+    if not match_ids:
+        return Resolution(row, "no_match", ouid=ouid)
 
-    probes = 0
-    for slot in order:
-        squad = nexon.squad(row.nexon_sn, character_id, TEAM_TYPE_NATIONAL, slot)
-        probes += 1
-        if not squad:
+    for match_id in match_ids:
+        detail = api.match_detail(match_id)
+        mine = next(
+            (info for info in (detail or {}).get("matchInfo") or [] if info.get("ouid") == ouid),
+            None,
+        )
+        if not mine:
             continue
-        for name, count in affiliation_team_colors(squad):
-            if name != row.team_color_name:
-                continue
-            # 인원수는 일치하지 않을 수 있다. 랭킹 표는 경기 시점 값이고 프로필은
-            # 현재 값이라, 같은 덱이어도 한두 명 교체로 숫자가 갈린다(밥상추 10 vs 11).
-            # 이름이 같으면 같은 덱으로 본다.
-            return Resolution(
-                row, "matched", TEAM_TYPE_NATIONAL, slot, count, starters(squad), probes,
-                character_id=character_id,
-            )
+        players = match_starters(mine, names)
+        if len(players) == 11:
+            return Resolution(row, "matched", SQUAD_SLOT_MATCH, players, ouid, match_id)
 
-    return Resolution(row, "unresolved", probes=probes, character_id=character_id)
+    return Resolution(row, "unresolved", ouid=ouid)
 
 
-def collect(nexon: Nexon, rows: List[RankRow], workers: int,
-            character_ids: Dict[int, str] = None) -> Tuple[List[Resolution], Counter]:
-    character_ids = character_ids or {}
+def collect(api: OpenApi, rows: List[RankRow], names: Dict[int, str], workers: int,
+            ouids: Dict[int, str] = None) -> Tuple[List[Resolution], Counter]:
+    ouids = ouids or {}
     results: List[Resolution] = []
     stats = Counter()
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(resolve_ranker, nexon, row, character_ids.get(row.nexon_sn)): row
+            pool.submit(resolve_ranker, api, row, names, ouids.get(row.nexon_sn)): row
             for row in rows
         }
         done = 0
@@ -444,12 +522,17 @@ def collect(nexon: Nexon, rows: List[RankRow], workers: int,
             row = futures[future]
             try:
                 resolution = future.result()
+            except QuotaExceeded:
+                # 남은 작업을 버리고 배치를 멈춘다. 반쪽 회차가 최신 회차로 앱에 뜨면
+                # 지난 주의 온전한 회차보다 못하다.
+                for pending in futures:
+                    pending.cancel()
+                raise
             except Exception as exc:  # noqa: BLE001 - 한 명이 죽어도 배치는 계속
                 logger.warning("랭커 %s 처리 실패: %s", row.nexon_sn, exc)
                 resolution = Resolution(row, "error")
             results.append(resolution)
             stats[resolution.status] += 1
-            stats["probes"] += resolution.probes
             done += 1
             if done % 200 == 0:
                 logger.info(
@@ -525,16 +608,16 @@ _INSERT_SNAPSHOT_SQL = text(f"""
         player_name = EXCLUDED.player_name
 """)
 
-_UPSERT_CHARACTER_ID_SQL = text(f"""
-    INSERT INTO {PLAYER_SCHEMA}.ranker_character_id (nexon_sn, character_id)
+_UPSERT_OUID_SQL = text(f"""
+    INSERT INTO {PLAYER_SCHEMA}.ranker_ouid (nexon_sn, ouid)
     SELECT * FROM unnest(
         CAST(:nexon_sn AS bigint[]),
-        CAST(:character_id AS text[])
+        CAST(:ouid AS text[])
     )
     ON CONFLICT (nexon_sn) DO UPDATE SET
-        character_id = EXCLUDED.character_id,
+        ouid = EXCLUDED.ouid,
         updated_at = now()
-    WHERE ranker_character_id.character_id IS DISTINCT FROM EXCLUDED.character_id
+    WHERE ranker_ouid.ouid IS DISTINCT FROM EXCLUDED.ouid
 """)
 
 _UPSERT_RUN_SQL = text(f"""
@@ -626,22 +709,22 @@ def _execute_with_retry(engine, statement, params) -> None:
             time.sleep(wait)
 
 
-def read_character_ids(engine) -> Dict[int, str]:
-    """이전 회차에 받아둔 characterId. 이게 있으면 popup 요청을 건너뛴다."""
+def read_ouids(engine) -> Dict[int, str]:
+    """이전 회차에 받아둔 ouid. 이게 있으면 /id 요청을 건너뛴다."""
     if engine is None:
         return {}
-    sql = text(f"SELECT nexon_sn, character_id FROM {PLAYER_SCHEMA}.ranker_character_id")
+    sql = text(f"SELECT nexon_sn, ouid FROM {PLAYER_SCHEMA}.ranker_ouid")
     with engine.connect() as conn:
         return {row[0]: row[1] for row in conn.execute(sql)}
 
 
-def save_character_ids(engine, pairs: Dict[int, str], batch: int) -> None:
+def save_ouids(engine, pairs: Dict[int, str], batch: int) -> None:
     items = list(pairs.items())
     for start in range(0, len(items), batch):
         chunk = items[start:start + batch]
-        _execute_with_retry(engine, _UPSERT_CHARACTER_ID_SQL, {
+        _execute_with_retry(engine, _UPSERT_OUID_SQL, {
             "nexon_sn": _pg_array_literal(sn for sn, _ in chunk),
-            "character_id": _pg_array_literal(cid for _, cid in chunk),
+            "ouid": _pg_array_literal(ouid for _, ouid in chunk),
         })
 
 
@@ -770,7 +853,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="랭커 대표팀 스쿼드 수집")
     parser.add_argument("--limit", type=int, default=_env_int("RANKER_SQUAD_LIMIT", 0),
                         help="처리할 랭커 수 (0=전체 10,000)")
-    parser.add_argument("--workers", type=int, default=_env_int("RANKER_SQUAD_WORKERS", 6))
+    parser.add_argument("--workers", type=int, default=_env_int("RANKER_SQUAD_WORKERS", 4))
     parser.add_argument("--from-json", default=None, metavar="경로",
                         help="크롤링 대신 --out 으로 떠둔 JSON 을 읽어 보고만 한다")
     parser.add_argument("--report", nargs="?", const="", default=None,
@@ -793,7 +876,7 @@ def main(argv=None) -> int:
 
     if args.from_json:
         # 이미 떠둔 덤프로 표를 다시 그리거나 DB 에 적재한다. 같은 수집을 두 번
-        # 돌리지 않으려는 것(1만명 크롤은 35분 + 넥슨 요청 1.2만 건이다).
+        # 돌리지 않으려는 것(1만명 수집은 넥슨 Open API 2~3만 건이다).
         with open(args.from_json, encoding="utf-8") as fp:
             payload = json.load(fp)
         # 덤프는 그때의 포지션 분류를 담고 있다. 분류 규칙이 바뀌었을 수 있으므로
@@ -808,8 +891,9 @@ def main(argv=None) -> int:
                     item["rank"], item["nexon_sn"], item["nickname"],
                     item["team_color_name"], None,
                 ),
-                "matched", TEAM_TYPE_NATIONAL, item.get("squad_slot"),
-                None, item["players"],
+                "matched",
+                item.get("squad_slot", SQUAD_SLOT_MATCH),
+                item["players"],
             )
             for item in payload["rankers"]
         ]
@@ -825,11 +909,10 @@ def main(argv=None) -> int:
                 "collected_on": collected_on,
                 "ranker_cnt": sum(
                     int(stats.get(key, 0))
-                    for key in ("matched", "unresolved", "no_team_color",
-                                "no_character_id", "error")
+                    for key in ("matched", "no_team_color", "error") + UNRESOLVED_STATUSES
                 ) or len(results),
                 "matched_cnt": int(stats.get("matched", len(results))),
-                "unresolved_cnt": int(stats.get("unresolved", 0)),
+                "unresolved_cnt": sum(int(stats.get(key, 0)) for key in UNRESOLVED_STATUSES),
             })
             logger.info("집계 완료")
 
@@ -845,6 +928,11 @@ def main(argv=None) -> int:
         delay=_env_float("RANKER_SQUAD_REQUEST_DELAY", 0.15),
         max_retries=_env_int("RANKER_SQUAD_MAX_RETRIES", 3),
     )
+    api = OpenApi(
+        os.environ.get("NEXON_OPEN_API_KEY", "").strip(),
+        delay=_env_float("RANKER_SQUAD_REQUEST_DELAY", 0.1),
+        max_retries=_env_int("RANKER_SQUAD_MAX_RETRIES", 4),
+    )
 
     engine = None if args.no_db else make_engine()
     if engine is None and not args.out:
@@ -854,32 +942,39 @@ def main(argv=None) -> int:
     rows = fetch_rank_rows(nexon, args.limit)
     logger.info("랭커 %d명 수집 (%.1fs)", len(rows), time.time() - started)
 
-    # 이전 회차의 characterId 가 있으면 랭커당 popup 요청 1건씩을 통째로 아낀다.
-    character_ids = read_character_ids(engine) if engine is not None else {}
-    if character_ids:
-        reused = sum(1 for row in rows if row.nexon_sn in character_ids)
-        logger.info("characterId 캐시 %d건 중 %d명 재사용", len(character_ids), reused)
+    names = fetch_player_names()
+    logger.info("선수 이름 %d건", len(names))
 
-    results, stats = collect(nexon, rows, args.workers, character_ids)
+    # 이전 회차의 ouid 가 있으면 랭커당 /id 요청 1건씩을 통째로 아낀다.
+    ouids = read_ouids(engine) if engine is not None else {}
+    if ouids:
+        reused = sum(1 for row in rows if row.nexon_sn in ouids)
+        logger.info("ouid 캐시 %d건 중 %d명 재사용", len(ouids), reused)
+
+    results, stats = collect(api, rows, names, args.workers, ouids)
     matched = [r for r in results if r.status == "matched"]
     logger.info(
-        "완료: matched=%d unresolved=%d no_team_color=%d no_character_id=%d error=%d "
-        "(스쿼드 요청 %d건, %.1fs)",
-        stats["matched"], stats["unresolved"], stats["no_team_color"],
-        stats["no_character_id"], stats["error"], stats["probes"], time.time() - started,
+        "완료: matched=%d no_team_color=%d no_ouid=%d no_match=%d unresolved=%d error=%d "
+        "(Open API 요청 %d건, %.1fs)",
+        stats["matched"], stats["no_team_color"], stats["no_ouid"], stats["no_match"],
+        stats["unresolved"], stats["error"], api.calls, time.time() - started,
     )
 
-    collected_on = date.today()
+    # 넥슨이 통째로 앓으면 error 가 쏟아진다. 그런 회차를 최신 회차로 덮어쓰지 않는다.
+    if rows and stats["error"] > len(rows) * 0.2:
+        raise RuntimeError(f"오류가 너무 많습니다({stats['error']}/{len(rows)}). 저장하지 않습니다.")
+
+    collected_on = today_kst()
     if engine is not None:
         batch = _env_int("RANKER_SQUAD_DB_BATCH", 2000)
         fresh = {
-            r.character_id: r.row.nexon_sn
+            r.row.nexon_sn: r.ouid
             for r in results
-            if r.character_id and character_ids.get(r.row.nexon_sn) != r.character_id
+            if r.ouid and ouids.get(r.row.nexon_sn) != r.ouid
         }
         if fresh:
-            save_character_ids(engine, {sn: cid for cid, sn in fresh.items()}, batch)
-            logger.info("characterId %d건 저장", len(fresh))
+            save_ouids(engine, fresh, batch)
+            logger.info("ouid %d건 저장", len(fresh))
 
         written = save_snapshot(engine, collected_on, results, batch)
         logger.info("스냅샷 %d행 저장 (%s)", written, collected_on)
@@ -889,13 +984,13 @@ def main(argv=None) -> int:
             "collected_on": collected_on,
             "ranker_cnt": len(rows),
             "matched_cnt": stats["matched"],
-            "unresolved_cnt": stats["unresolved"],
+            "unresolved_cnt": sum(stats[key] for key in UNRESOLVED_STATUSES),
         })
         logger.info("집계 완료")
 
     if args.out:
         payload = {
-            "collected_on": date.today().isoformat(),
+            "collected_on": collected_on.isoformat(),
             "stats": dict(stats),
             "rankers": [
                 {
@@ -904,6 +999,7 @@ def main(argv=None) -> int:
                     "nickname": r.row.nickname,
                     "team_color_name": r.row.team_color_name,
                     "squad_slot": r.slot,
+                    "match_id": r.match_id,
                     "players": r.players,
                 }
                 for r in matched

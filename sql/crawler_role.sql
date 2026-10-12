@@ -51,6 +51,7 @@ grant select, insert, update, delete on player.ranker_squad_snapshot   to fco_cr
 grant select, insert, update, delete on player.team_color_player_usage to fco_crawler;
 grant select, insert, update         on player.ranker_squad_run        to fco_crawler;
 grant select, insert, update         on player.ranker_character_id     to fco_crawler;
+grant select, insert, update         on player.ranker_ouid             to fco_crawler;
 grant select                         on player.team_colors             to fco_crawler;
 
 -- 6) 클럽 경력 배치(career_job.py) 권한 — 2026-10 추가.
