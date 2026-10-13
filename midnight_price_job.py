@@ -41,8 +41,10 @@ def sample_cards(engine, limit: int) -> List[Tuple[int, int]]:
     """후보 풀에 든 카드에서 표본. 풀이 비었으면(상품 미등록) 빈 목록."""
     with engine.connect() as conn:
         return [tuple(r) for r in conn.execute(text(
-            "SELECT DISTINCT spid, strong FROM spend.pack_pool_card "
-            "ORDER BY spid, strong LIMIT :n"
+            # spid 순으로 자르면 한 시즌 저강화 카드로 몰린다. 해시 순서로 고루 섞되,
+            # 날마다 같은 표본이 뽑혀 이틀 치를 맞대어 볼 수 있게 한다.
+            "SELECT spid, strong FROM (SELECT DISTINCT spid, strong FROM spend.pack_pool_card) c "
+            "ORDER BY md5(spid::text || '/' || strong::text) LIMIT :n"
         ), {"n": limit})]
 
 
