@@ -203,24 +203,29 @@ def resolve_card_spids(engine, sns: Sequence[int]) -> Tuple[int, int]:
 # ---- Top Price 후보 풀 --------------------------------------------------------
 
 
+# 활성 상품에서 닿는 표 전체(reach). 시작점 = 상품의 확률표(sn) + config 안의 보상 표들
+# (SSS 절구 칸 choice_sns, 열쇠 교환소 exchange[].sn). config 쪽을 빼면 절구·교환소 보상
+# 풀이 안 만들어진다. price_snapshot_job 도 같은 범위의 카드 기준가를 모은다.
+REACH_CTE = (
+    "WITH RECURSIVE live AS ("
+    "  SELECT * FROM spend.product WHERE is_active AND (ends_at IS NULL OR ends_at > now())), "
+    "reach(sn) AS ("
+    "  SELECT sn FROM live WHERE sn IS NOT NULL "
+    "  UNION SELECT c.sn::int FROM live, "
+    "    jsonb_array_elements(coalesce(live.config->'cells', '[]'::jsonb)) AS cell, "
+    "    jsonb_array_elements_text(cell->'choice_sns') AS c(sn) "
+    "  UNION SELECT (x->>'sn')::int FROM live, "
+    "    jsonb_array_elements(coalesce(live.config->'exchange', '[]'::jsonb)) AS x "
+    "  UNION SELECT r.sub_sn FROM spend.prob_row r JOIN reach ON r.sn = reach.sn "
+    "    WHERE r.sub_sn IS NOT NULL) "
+)
+
+
 def reachable_top_price(engine) -> List[int]:
     """활성 상품에서 하위 상자를 따라 닿는 Top Price 표."""
     with engine.connect() as conn:
         return [sn for (sn,) in conn.execute(text(
-            # 시작점 = 상품의 확률표(sn) + config 안의 보상 표들(SSS 절구 칸 choice_sns,
-            # 열쇠 교환소 exchange[].sn). config 쪽을 빼면 절구·교환소 보상 풀이 안 만들어진다.
-            "WITH RECURSIVE live AS ("
-            "  SELECT * FROM spend.product WHERE is_active AND (ends_at IS NULL OR ends_at > now())), "
-            "reach(sn) AS ("
-            "  SELECT sn FROM live WHERE sn IS NOT NULL "
-            "  UNION SELECT c.sn::int FROM live, "
-            "    jsonb_array_elements(coalesce(live.config->'cells', '[]'::jsonb)) AS cell, "
-            "    jsonb_array_elements_text(cell->'choice_sns') AS c(sn) "
-            "  UNION SELECT (x->>'sn')::int FROM live, "
-            "    jsonb_array_elements(coalesce(live.config->'exchange', '[]'::jsonb)) AS x "
-            "  UNION SELECT r.sub_sn FROM spend.prob_row r JOIN reach ON r.sn = reach.sn "
-            "    WHERE r.sub_sn IS NOT NULL) "
-            "SELECT t.sn FROM reach JOIN spend.prob_table t ON t.sn = reach.sn "
+            REACH_CTE + "SELECT t.sn FROM reach JOIN spend.prob_table t ON t.sn = reach.sn "
             "WHERE t.table_kind = 'top_price' ORDER BY t.sn"
         ))]
 
