@@ -1,0 +1,53 @@
+name: iteminfo
+
+# 현질 도우미: 넥슨 확률표(iteminfo.nexon.com/probability/fco) 전량 → spend.prob_table/prob_row,
+# 콘솔에 등록된 상품에서 닿는 Top Price 표의 후보 풀 초안 → spend.pack_pool (iteminfo_job.py).
+#
+# 넥슨은 목요일 점검 때 상품·확률표를 바꾼다. 매일 한 번 돌되, 해시가 같은 표는 다시 쓰지
+# 않으므로(바뀐 표만 write) 평일엔 DB 쓰기가 거의 없다. 목요일 점검(대개 ~16시) 뒤를 잡으려고
+# 18:30 KST 에 돈다.
+#
+# ⚠️ iteminfo.nexon.com 은 Cloudflare 뒤라 브라우저 헤더가 없으면 403 이다(iteminfo_job.BROWSER_HEADERS).
+#    GitHub 러너 IP 가 막히면 '받음 0' 으로 실패한다 — 그때는 수동 실행 로그부터 볼 것.
+
+on:
+  schedule:
+    - cron: "30 9 * * *"   # 09:30 UTC = 18:30 KST
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "테스트용 표 수 상한 (0=전체)"
+        required: false
+        default: "0"
+      force:
+        description: "해시 무시하고 전부 다시 쓰기 (1=예)"
+        required: false
+        default: "0"
+
+# 🔒 이 저장소는 PUBLIC 이다. pull_request 트리거 금지(포크 PR 이 시크릿에 닿을 수 있다).
+permissions:
+  contents: read
+
+concurrency:
+  group: iteminfo
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Parser tests
+        run: python -m unittest discover -s tests
+      - name: Collect probability tables
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ITEMINFO_LIMIT: ${{ github.event.inputs.limit || '0' }}
+          ITEMINFO_FORCE: ${{ github.event.inputs.force || '0' }}
+        run: python iteminfo_job.py

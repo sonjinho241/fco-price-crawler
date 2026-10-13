@@ -1,0 +1,43 @@
+name: midnight-price
+
+# 현질 도우미 0단계 검증: "데이터센터 일별 추이의 D 일 값 = D 일 0~1시 기준가" 인가?
+# (넥슨 Top Price 팩은 개봉일 0~1시 기준가 순위로 카드를 정한다.)
+#  - record  00:20 KST: 후보 풀 카드 표본의 현재가를 오늘 날짜로 기록(0~1시를 벗어나면 기록 안 함)
+#  - compare 12:20 KST: 어제 기록을 추이의 어제 값과 맞대어 일치율 출력
+# 일치율이 ~100% 로 며칠 이어지면 추이 값을 그대로 쓰고 이 워크플로는 끈다.
+# GitHub cron 은 수십 분 늦을 수 있어 record 를 00:20 에 둔다.
+
+on:
+  schedule:
+    - cron: "20 15 * * *"  # 15:20 UTC = 00:20 KST → record
+    - cron: "20 3 * * *"   # 03:20 UTC = 12:20 KST → compare
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "record | compare"
+        required: false
+        default: "compare"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: midnight-price
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Midnight price ${{ github.event.inputs.mode || (github.event.schedule == '20 15 * * *' && 'record' || 'compare') }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MIDNIGHT_MODE: ${{ github.event.inputs.mode || (github.event.schedule == '20 15 * * *' && 'record' || 'compare') }}
+        run: python midnight_price_job.py

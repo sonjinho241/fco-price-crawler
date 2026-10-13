@@ -61,3 +61,15 @@ grant select                         on player.team_colors             to fco_cr
 grant select, insert, update         on player.player_career       to fco_crawler;
 grant select, insert, update, delete on player.player_career_clubs to fco_crawler;
 grant select                         on player.clubs               to fco_crawler;
+
+-- 7) 현질 도우미(iteminfo_job.py · midnight_price_job.py) 권한 — 2026-10 추가.
+--    spend 스키마 테이블은 백엔드 부트스트랩(BOOTSTRAP_VERSION 24)이 만든다. 서버 배포 뒤 실행할 것.
+--    확률표는 바뀐 표만 DELETE 후 다시 INSERT, 후보 풀은 크롤러가 초안을 쓰고 운영자가 확정한다.
+grant usage on schema spend to fco_crawler;
+grant select, insert, update, delete on spend.prob_table      to fco_crawler;
+grant select, insert, update, delete on spend.prob_row        to fco_crawler;
+grant select, insert, update, delete on spend.pack_pool       to fco_crawler;
+grant select, insert, update, delete on spend.pack_pool_card  to fco_crawler;
+grant select, insert, delete         on spend.price_snapshot  to fco_crawler;
+grant select                         on spend.product         to fco_crawler;
+grant select                         on player.seasonid       to fco_crawler;
