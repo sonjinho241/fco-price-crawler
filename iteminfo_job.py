@@ -203,14 +203,25 @@ def resolve_card_spids(engine, sns: Sequence[int]) -> Tuple[int, int]:
 # ---- Top Price 후보 풀 --------------------------------------------------------
 
 
-# 활성 상품에서 닿는 표 전체(reach). 시작점 = 상품의 확률표(sn) + config 안의 보상 표들
-# (SSS 절구 칸 choice_sns, 열쇠 교환소 exchange[].sn). config 쪽을 빼면 절구·교환소 보상
+# 활성 상품에서 닿는 표 전체(reach). 시작점 = 상품의 확률표(sn) + 보상 표들
+# (SSS 절구 칸 choice_sns, 교환소 exchange[].sn). config 쪽을 빼면 절구·교환소 보상
 # 풀이 안 만들어진다. price_snapshot_job 도 같은 범위의 카드 기준가를 모은다.
+# 2026-10-19 부터 규칙은 이벤트 회차(spend.event, event_kind = crystal_shop/key_shop/sss_board)
+# config 에 있다(절구 칸은 special/normal.cells). 옛 상품 config 경로도 남겨 둔다(지금은 비어 있음).
 REACH_CTE = (
     "WITH RECURSIVE live AS ("
     "  SELECT * FROM spend.product WHERE is_active AND (ends_at IS NULL OR ends_at > now())), "
+    "live_event AS ("
+    "  SELECT * FROM spend.event WHERE is_active AND ends_at > now() "
+    "  AND event_kind IN ('crystal_shop', 'key_shop', 'sss_board')), "
     "reach(sn) AS ("
     "  SELECT sn FROM live WHERE sn IS NOT NULL "
+    "  UNION SELECT (x->>'sn')::int FROM live_event, "
+    "    jsonb_array_elements(coalesce(live_event.config->'exchange', '[]'::jsonb)) AS x "
+    "  UNION SELECT c.sn::int FROM live_event, "
+    "    jsonb_array_elements(coalesce(live_event.config->'special'->'cells', '[]'::jsonb) "
+    "      || coalesce(live_event.config->'normal'->'cells', '[]'::jsonb)) AS cell, "
+    "    jsonb_array_elements_text(cell->'choice_sns') AS c(sn) "
     "  UNION SELECT c.sn::int FROM live, "
     "    jsonb_array_elements(coalesce(live.config->'cells', '[]'::jsonb)) AS cell, "
     "    jsonb_array_elements_text(cell->'choice_sns') AS c(sn) "
