@@ -72,4 +72,6 @@ grant select, insert, update, delete on spend.pack_pool       to fco_crawler;
 grant select, insert, update, delete on spend.pack_pool_card  to fco_crawler;
 grant select, insert, delete         on spend.price_snapshot  to fco_crawler;
 grant select                         on spend.product         to fco_crawler;
+-- 2026-10-19: 교환·절구 보상 규칙이 회차(spend.event) config 로 옮겨 갔다. 앱 서버 BOOTSTRAP 27 이 적용한다.
+grant select                         on spend.event           to fco_crawler;
 grant select                         on player.seasonid       to fco_crawler;
