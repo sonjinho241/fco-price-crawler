@@ -13,6 +13,9 @@ name: iteminfo
 on:
   schedule:
     - cron: "30 9 * * *"   # 09:30 UTC = 18:30 KST
+    # 목요일 점검 뒤 새 팩을 빨리 내려고 17~23시 KST 매시 한 번 더 돈다. 콘솔에 팩을 등록하면
+    # 다음 정각에 후보 풀이 생기고, 서버가 순위 카드가 다 채워진 걸 확인하면 앱에 저절로 선다.
+    - cron: "0 8-14 * * 4"  # 목 08:00~14:00 UTC = 목 17:00~23:00 KST
   workflow_dispatch:
     inputs:
       limit:
