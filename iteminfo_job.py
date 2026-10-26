@@ -8,7 +8,10 @@ FCO 매니저 '현질 도우미'의 원천 데이터. 하루 1회 돈다(넥슨�
 2. 표마다 해시를 비교해 **바뀐 표만** 행을 갈아 쓴다. 전량 16만 행을 매일 다시 쓰면
    Disk IO 예산을 태운다(2026-07 사고). 행은 JSON 문자열 하나로 바인드한다.
 3. 카드 확정 행은 (시즌 코드, 선수명)으로 spid 를 찾는다. 이름이 유일하게 맞을 때만 채운다.
-4. 운영자가 콘솔에 등록한 상품(spend.product)에서 닿는 Top Price 표만 후보 풀 초안을 만든다.
+4. 운영자가 콘솔에 등록한 상품(spend.product)·이벤트 회차(spend.event)에서 닿는 Top Price 표만 후보 풀
+   초안을 만든다. 등록돼 있으면 끔·미리보기·종료일 지남과 상관없이 대상이고, 콘솔에서 삭제하면 다음
+   실행부터 대상에서 빠진다(2026-10-26 사용자 결정 — 판매를 내리는 건 운영자가 삭제로만 한다).
+   확률표 자체(1~3)는 등록과 상관없이 넥슨 목록 전체를 받는다 — 콘솔이 그 표에서 sn 을 골라 등록하기 때문.
    조건 = 등급칸 클래스 · 제목의 강화 범위 · 최종 OVR 하한. 최종 OVR = 기본 OVR + 강화 보너스
    (2026-10-13 넥슨 최종 OVR 표 1,142장과 대조해 전부 일치). 카드 목록이 바뀌면 확정을 푼다 —
    운영자가 확정한 풀만 앱에 기댓값이 공개된다.
@@ -208,12 +211,18 @@ def resolve_card_spids(engine, sns: Sequence[int]) -> Tuple[int, int]:
 # 풀이 안 만들어진다. price_snapshot_job 도 같은 범위의 카드 기준가를 모은다.
 # 2026-10-19 부터 규칙은 이벤트 회차(spend.event, event_kind = crystal_shop/key_shop/sss_board)
 # config 에 있다(절구 칸은 special/normal.cells). 옛 상품 config 경로도 남겨 둔다(지금은 비어 있음).
+# 2026-10-26 범용 회차 flow: 보상 표는 games[].cells[].choice_sns(판)·games[].sn(확률표 뽑기)·
+# games[].tiers[].outcomes[].sn(등급 사다리)에 있다. 미리보기 회차(is_preview)도 켜져 있으면 포함한다 —
+# 운영자가 공개 전에 폰에서 시험하려면 풀이 먼저 있어야 한다.
+# 대상 = 콘솔에 등록된 행 전부(끔·미리보기·종료일 지남 포함). 콘솔에서 삭제하면 행이 없어져 빠진다
+# (2026-10-26 사용자 결정). 꺼 둔 회차도 넣는 건, 복제한 회차를 끈 채 sn 을 고치는 동안 풀이 먼저
+# 만들어져 있어야 미리보기로 켜자마자 열리기 때문이다. 옛 현질 도우미 event 행(쓸돌·쿠폰)은 뺀다.
 REACH_CTE = (
     "WITH RECURSIVE live AS ("
-    "  SELECT * FROM spend.product WHERE is_active AND (ends_at IS NULL OR ends_at > now())), "
+    "  SELECT * FROM spend.product), "
     "live_event AS ("
-    "  SELECT * FROM spend.event WHERE is_active AND ends_at > now() "
-    "  AND event_kind IN ('crystal_shop', 'key_shop', 'sss_board')), "
+    "  SELECT * FROM spend.event "
+    "  WHERE event_kind IN ('crystal_shop', 'key_shop', 'sss_board', 'flow')), "
     "reach(sn) AS ("
     "  SELECT sn FROM live WHERE sn IS NOT NULL "
     "  UNION SELECT (x->>'sn')::int FROM live_event, "
@@ -222,6 +231,16 @@ REACH_CTE = (
     "    jsonb_array_elements(coalesce(live_event.config->'special'->'cells', '[]'::jsonb) "
     "      || coalesce(live_event.config->'normal'->'cells', '[]'::jsonb)) AS cell, "
     "    jsonb_array_elements_text(cell->'choice_sns') AS c(sn) "
+    "  UNION SELECT c.sn::int FROM live_event, "
+    "    jsonb_array_elements(coalesce(live_event.config->'games', '[]'::jsonb)) AS g, "
+    "    jsonb_array_elements(coalesce(g->'cells', '[]'::jsonb)) AS cell, "
+    "    jsonb_array_elements_text(cell->'choice_sns') AS c(sn) "
+    "  UNION SELECT (g->>'sn')::int FROM live_event, "
+    "    jsonb_array_elements(coalesce(live_event.config->'games', '[]'::jsonb)) AS g "
+    "  UNION SELECT (o->>'sn')::int FROM live_event, "
+    "    jsonb_array_elements(coalesce(live_event.config->'games', '[]'::jsonb)) AS g, "
+    "    jsonb_array_elements(coalesce(g->'tiers', '[]'::jsonb)) AS t, "
+    "    jsonb_array_elements(coalesce(t->'outcomes', '[]'::jsonb)) AS o "
     "  UNION SELECT c.sn::int FROM live, "
     "    jsonb_array_elements(coalesce(live.config->'cells', '[]'::jsonb)) AS cell, "
     "    jsonb_array_elements_text(cell->'choice_sns') AS c(sn) "
@@ -233,7 +252,7 @@ REACH_CTE = (
 
 
 def reachable_top_price(engine) -> List[int]:
-    """활성 상품에서 하위 상자를 따라 닿는 Top Price 표."""
+    """등록된 상품·회차에서 하위 상자를 따라 닿는 Top Price 표."""
     with engine.connect() as conn:
         return [sn for (sn,) in conn.execute(text(
             REACH_CTE + "SELECT t.sn FROM reach JOIN spend.prob_table t ON t.sn = reach.sn "

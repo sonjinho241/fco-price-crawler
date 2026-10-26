@@ -26,6 +26,7 @@ from typing import List, Tuple
 from sqlalchemy import text
 
 from crawler_job import fetch_price_snapshot, make_engine, make_session
+from iteminfo_job import REACH_CTE
 
 KST = timezone(timedelta(hours=9))
 
@@ -38,12 +39,15 @@ def _env_int(name: str, default: int) -> int:
 
 
 def sample_cards(engine, limit: int) -> List[Tuple[int, int]]:
-    """후보 풀에 든 카드에서 표본. 풀이 비었으면(상품 미등록) 빈 목록."""
+    """등록된 상품·회차의 후보 풀 카드에서 표본. 풀이 비었으면(상품 미등록) 빈 목록."""
     with engine.connect() as conn:
         return [tuple(r) for r in conn.execute(text(
             # spid 순으로 자르면 한 시즌 저강화 카드로 몰린다. 해시 순서로 고루 섞되,
             # 날마다 같은 표본이 뽑혀 이틀 치를 맞대어 볼 수 있게 한다.
-            "SELECT spid, strong FROM (SELECT DISTINCT spid, strong FROM spend.pack_pool_card) c "
+            # 콘솔에서 삭제한 상품·회차의 풀은 표본에서 뺀다(등록된 것에서 닿는 풀만, REACH_CTE).
+            REACH_CTE
+            + "SELECT spid, strong FROM (SELECT DISTINCT c.spid, c.strong FROM spend.pack_pool_card c "
+            "  JOIN reach ON reach.sn = c.sn) c "
             "ORDER BY md5(spid::text || '/' || strong::text) LIMIT :n"
         ), {"n": limit})]
 

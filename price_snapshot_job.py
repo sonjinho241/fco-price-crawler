@@ -6,7 +6,7 @@ D 일 값이 그 기준가와 같다면(0단계 — midnight_price_job.py 로 �
 D 일 기준가를 얻는다. 이 작업은 그 가정 위에서 어제(D) 값을 모은다.
 ⚠️ 0단계 일치율이 확인되기 전에는 스케줄을 켜지 않는다(워크플로 price-snapshot.yml 참고).
 
-대상 = 활성 상품에서 닿는 표의 카드 전부:
+대상 = 콘솔에 등록된 상품·회차에서 닿는 표의 카드 전부(삭제하면 빠진다, iteminfo_job.REACH_CTE):
   - Top Price 후보 풀 카드(spend.pack_pool_card, 확정 여부와 무관 — 순위를 매기려면 다 필요)
   - 카드 확정 행(spend.prob_row row_kind='card', spid 를 찾은 것)
 
