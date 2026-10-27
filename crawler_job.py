@@ -3,8 +3,13 @@ FC Online 선수 "최신 시세만" 일일 크롤러 — 공개 저장소용 자
 
 이 파일 하나로 끝난다(메인 비공개 앱 저장소에 의존하지 않는다). GitHub Actions
 (공개 저장소 = Actions 분 무제한)에서 하루 1회 실행한다. 넥슨에서 선수×강화단계당
-'가장 최근 1줄'만 받아 player.player_price_latest 에 upsert 한다.
+'가장 최근 1줄'만 받아 player.player_price_latest 와 player.player_price_strongs 에 upsert 한다.
 멱등(idempotent)하므로 중간에 죽어도 다시 돌리면 이어서 채워진다.
+
+⚠️ 2026-10-27 부터 두 표에 함께 쓴다(전환 기간). player_price_strongs 는 카드당 한 행에
+   강화 1~13단계를 배열로 담는 새 표(115만 행·159MB → 8.8만 행·22MB)이고, 앱 서버가 그 표로
+   옮겨 가면 player_price_latest 쓰기를 지운다. 표 정의는 메인 저장소
+   Backend/FCOmanager_server/scripts/player_price_strongs.sql.
 
 ⚠️ 비밀정보(DATABASE_URL = DB 주소 + 비밀번호)는 절대 이 파일/저장소에 두지 않는다.
    GitHub repo Settings → Secrets and variables → Actions → DATABASE_URL 로만 주입한다.
@@ -232,6 +237,42 @@ _UPSERT_LATEST_SQL = text(f"""
     WHERE player_price_latest.price IS DISTINCT FROM EXCLUDED.price
 """)
 
+# 카드당 한 행(player_price_strongs)에 강화단계별 값을 끼워 넣는다. 들어온 (spid, strong) 만
+# 바꾸고 나머지 단계는 기존 값을 둔다(넥슨 호출이 실패한 단계는 아예 안 온다). 날짜는 값이
+# 실제로 바뀐 단계만 새 날짜로 바뀐다. 배열 전체가 같으면 UPDATE 를 건너뛴다(옛 표와 같은
+# no-op skip). 메인 저장소 prices/crud.py 의 _UPSERT_LATEST_SQL 과 같은 텍스트를 유지한다.
+_UPSERT_STRONGS_SQL = text(f"""
+    WITH incoming AS (
+        SELECT * FROM unnest(
+            CAST(:spids AS bigint[]),
+            CAST(:strongs AS smallint[]),
+            CAST(:prices AS bigint[]),
+            CAST(:price_dates AS date[])
+        ) AS u(spid, strong, price, price_date)
+    ),
+    merged AS (
+        SELECT
+            k.spid,
+            array_agg(COALESCE(i.price, o.prices[g.strong]) ORDER BY g.strong) AS prices,
+            array_agg(
+                CASE WHEN i.price IS NOT NULL AND i.price IS DISTINCT FROM o.prices[g.strong]
+                     THEN i.price_date ELSE o.price_dates[g.strong] END
+                ORDER BY g.strong
+            ) AS price_dates
+        FROM (SELECT DISTINCT spid FROM incoming) k
+        CROSS JOIN generate_series(1, 13) AS g(strong)
+        LEFT JOIN incoming i ON i.spid = k.spid AND i.strong = g.strong
+        LEFT JOIN {PLAYER_SCHEMA}.player_price_strongs o ON o.spid = k.spid
+        GROUP BY k.spid
+    )
+    INSERT INTO {PLAYER_SCHEMA}.player_price_strongs (spid, prices, price_dates)
+    SELECT spid, prices, price_dates FROM merged
+    ON CONFLICT (spid) DO UPDATE SET
+        prices = EXCLUDED.prices,
+        price_dates = EXCLUDED.price_dates
+    WHERE player_price_strongs.prices IS DISTINCT FROM EXCLUDED.prices
+""")
+
 
 def _pg_array_literal(values) -> str:
     """리스트를 Postgres 배열 리터럴 문자열('{...}') 하나로 직렬화한다.
@@ -254,7 +295,9 @@ _DB_MAX_RETRIES = 4
 
 
 def bulk_upsert_latest(engine, rows: List[dict]) -> int:
-    """최신 시세들을 player_price_latest 에 한 번에 upsert. 멱등. 반환=시도 행 수.
+    """최신 시세들을 player_price_latest·player_price_strongs 에 한 번에 upsert. 멱등. 반환=시도 행 수.
+
+    rows 안에 같은 (spid, strong) 가 두 번 들어오면 안 된다(새 표의 배열 길이 CHECK 에 걸린다).
 
     price 가 기존 값과 같으면 ON CONFLICT 시 UPDATE 를 건너뛴다
     (WHERE price IS DISTINCT FROM EXCLUDED.price). 시세는 대부분 날마다 안 바뀌는데,
@@ -289,8 +332,10 @@ def bulk_upsert_latest(engine, rows: List[dict]) -> int:
     }
     for attempt in range(_DB_MAX_RETRIES):
         try:
+            # 두 표를 한 트랜잭션에 쓴다. 재시도해도 둘 다 멱등이라 안전하다.
             with engine.connect() as conn:
                 conn.execute(_UPSERT_LATEST_SQL, params)
+                conn.execute(_UPSERT_STRONGS_SQL, params)
                 conn.commit()
             return len(rows)
         except OperationalError as exc:
@@ -319,9 +364,9 @@ def vacuum_analyze(engine) -> None:
     ⚠️ VACUUM 은 트랜잭션 블록 안에서 못 돈다. AUTOCOMMIT 커넥션으로 실행한다.
     ⚠️ VACUUM FULL 이 아니다(배타 락 없음). 일상 회수용이라 검색/배치를 막지 않는다.
     """
-    sql = f"VACUUM (ANALYZE) {PLAYER_SCHEMA}.player_price_latest"
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(text(sql))
+        for table in ("player_price_latest", "player_price_strongs"):
+            conn.execute(text(f"VACUUM (ANALYZE) {PLAYER_SCHEMA}.{table}"))
 
 
 # =============================================================================
@@ -363,6 +408,22 @@ def _shard(items: List[int]) -> List[int]:
 def _chunked(items, size: int):
     for i in range(0, len(items), size):
         yield items[i:i + size]
+
+
+def _batches_by_spid(rows: List[dict], size: int):
+    """spid 순으로 정렬해 size 행 안팎으로 자르되 한 spid 의 단계들은 쪼개지 않는다.
+
+    새 표는 카드당 한 행이라 같은 카드가 여러 배치에 흩어지면 그 행을 배치 수만큼
+    다시 쓴다(dead tuple·WAL 이 그만큼 는다).
+    """
+    batch: List[dict] = []
+    for row in sorted(rows, key=lambda r: (r["spid"], r["strong"])):
+        if len(batch) >= size and batch[-1]["spid"] != row["spid"]:
+            yield batch
+            batch = []
+        batch.append(row)
+    if batch:
+        yield batch
 
 
 def _fetch_one(session, spid: int, strong: int, max_retries: int, delay: float) -> Optional[dict]:
@@ -434,8 +495,9 @@ def run() -> None:
         all_spids = all_spids[:spid_limit]
     spids = _shard(all_spids)
 
-    tasks = [(spid, strong) for spid in spids for strong in strongs]
-    total = len(tasks)
+    total = len(spids) * len(strongs)
+    # 청크를 카드 경계에 맞춘다(한 카드의 단계들이 한 청크 = 한 쓰기에 들어가게).
+    spids_per_chunk = max(1, chunk_size // max(1, len(strongs)))
     logger.info(
         "배치 시작: spids=%d × strongs=%s → tasks=%d (workers=%d, delay=%.3fs)",
         len(spids), strongs, total, workers, delay,
@@ -447,10 +509,11 @@ def run() -> None:
 
     # 작업을 청크 단위로 처리해 미해결 future 수(=메모리)를 상한선 안에 둔다.
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        for chunk in _chunked(tasks, chunk_size):
+        for spid_chunk in _chunked(spids, spids_per_chunk):
             futures = [
                 executor.submit(_fetch_one, session, spid, strong, max_retries, delay)
-                for spid, strong in chunk
+                for spid in spid_chunk
+                for strong in strongs
             ]
             buffer: List[dict] = []
             for future in as_completed(futures):
@@ -458,11 +521,8 @@ def run() -> None:
                 row = future.result()
                 if row is not None:
                     buffer.append(row)
-                    if len(buffer) >= db_batch:
-                        written += bulk_upsert_latest(engine, buffer)
-                        buffer = []
-            if buffer:
-                written += bulk_upsert_latest(engine, buffer)
+            for batch in _batches_by_spid(buffer, db_batch):
+                written += bulk_upsert_latest(engine, batch)
 
             elapsed = time.monotonic() - started
             rate = done / elapsed if elapsed else 0
@@ -480,7 +540,7 @@ def run() -> None:
     if written:
         try:
             vacuum_analyze(engine)
-            logger.info("VACUUM (ANALYZE) 완료: %s.player_price_latest", PLAYER_SCHEMA)
+            logger.info("VACUUM (ANALYZE) 완료: %s.player_price_latest·player_price_strongs", PLAYER_SCHEMA)
         except Exception as exc:  # 청소 실패가 배치 성공을 뒤집지 않게.
             logger.warning("VACUUM 스킵(실패): %s", exc)
 

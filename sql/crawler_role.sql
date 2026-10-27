@@ -6,7 +6,7 @@
 --       딱 필요한 권한만 가진 전용 롤의 접속문자열을 써야 한다).
 --
 -- 이 롤이 할 수 있는 것:
---   시세 크롤러: player.players 읽기 + player.player_price_latest 읽기/쓰기
+--   시세 크롤러: player.players 읽기 + player.player_price_latest·player_price_strongs 읽기/쓰기
 --   메타 크롤러: player 스키마의 선수/시즌/spid/레퍼런스 테이블 읽기/쓰기 (아래 4번)
 --
 -- ⚠️ 아래 비밀번호 자리는 실행할 때만 강력한 값으로 바꾸고, 이 파일에 평문으로
@@ -22,6 +22,8 @@ grant usage   on schema   player   to fco_crawler;
 -- 3) 딱 필요한 테이블 권한만 (player_price_latest 의 upsert = INSERT + UPDATE)
 grant select               on player.players              to fco_crawler;
 grant select, insert, update on player.player_price_latest to fco_crawler;
+-- 카드당 한 행 시세 표(2026-10-27). 표 정의는 메인 저장소 scripts/player_price_strongs.sql.
+grant select, insert, update on player.player_price_strongs to fco_crawler;
 
 -- 4) 메타 크롤러(meta_crawler.py) 권한 — 목/금 메타 자동화(2026-07)에서 추가.
 --    upsert(ON CONFLICT DO UPDATE)는 INSERT+UPDATE, RETURNING/WHERE 는 SELECT 가 필요.
