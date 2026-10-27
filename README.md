@@ -111,6 +111,9 @@ DB의 `player.player_price_latest` 테이블에 upsert 한다. 이 표 덕분에
 - **무엇을 넣나**: `player.ranker_squad_snapshot`(원본, 랭커×11행) →
   `player.team_color_player_usage`(집계). 회차 로그는 `player.ranker_squad_run`.
   ouid 캐시는 `player.ranker_ouid`. 스키마·권한은 `sql/ranker_squad.sql` (실제 DB 에도 GRANT 해야 한다).
+  저장 뒤 스냅샷·집계 모두 **최근 2회차만 남기고 지운다**(`RANKER_SQUAD_KEEP_SNAPSHOTS`·
+  `RANKER_SQUAD_KEEP_USAGE`, 0 이면 안 지움). 앱은 최신 회차만 읽고, 원본이 회차당 ~19MB 라
+  쌓아두면 Supabase 500MB 를 넘는다(2026-10-27 554MB).
 - **시크릿**: `DATABASE_URL`, `NEXON_OPEN_API_KEY` (repo Settings → Secrets → Actions).
   🔒 이 저장소는 PUBLIC 이다. 키는 헤더로만 보내고 로그·예외·덤프에 남기지 않는다.
 - **경로**:

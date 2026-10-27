@@ -686,6 +686,26 @@ _AGGREGATE_SQL = text(f"""
         avg_build_up = EXCLUDED.avg_build_up
 """)
 
+# 앱은 최신 회차 하나만 읽는다. 원본은 회차당 ~19MB 라 그대로 쌓으면 Supabase 500MB 를
+# 넘는다(2026-10-27 실제로 554MB). 최근 :keep 회차만 남기고 나머지는 지운다.
+# 테이블이 비어 있으면 기준이 NULL 이라 아무것도 지우지 않는다.
+_PRUNE_SQL_TEMPLATE = """
+    DELETE FROM {PLAYER_SCHEMA}.{table}
+    WHERE collected_on < (
+        SELECT MIN(collected_on) FROM (
+            SELECT DISTINCT collected_on FROM {PLAYER_SCHEMA}.{table}
+            ORDER BY collected_on DESC
+            LIMIT :keep
+        ) recent
+    )
+"""
+_PRUNE_SNAPSHOT_SQL = text(_PRUNE_SQL_TEMPLATE.format(
+    PLAYER_SCHEMA=PLAYER_SCHEMA, table="ranker_squad_snapshot",
+))
+_PRUNE_USAGE_SQL = text(_PRUNE_SQL_TEMPLATE.format(
+    PLAYER_SCHEMA=PLAYER_SCHEMA, table="team_color_player_usage",
+))
+
 _DB_MAX_RETRIES = 4
 
 
@@ -765,6 +785,18 @@ def save_snapshot(engine, collected_on: date, results: List["Resolution"], batch
 
 def aggregate(engine, collected_on: date) -> None:
     _execute_with_retry(engine, _AGGREGATE_SQL, {"collected_on": collected_on})
+
+
+def prune_old_runs(engine) -> None:
+    """최근 회차만 남긴다. 0 이하로 주면 그 테이블은 지우지 않는다."""
+    for label, statement, keep in (
+        ("스냅샷", _PRUNE_SNAPSHOT_SQL, _env_int("RANKER_SQUAD_KEEP_SNAPSHOTS", 2)),
+        ("집계", _PRUNE_USAGE_SQL, _env_int("RANKER_SQUAD_KEEP_USAGE", 2)),
+    ):
+        if keep <= 0:
+            continue
+        _execute_with_retry(engine, statement, {"keep": keep})
+        logger.info("%s 최근 %d회차만 남김", label, keep)
 
 
 # =============================================================================
@@ -915,6 +947,7 @@ def main(argv=None) -> int:
                 "unresolved_cnt": sum(int(stats.get(key, 0)) for key in UNRESOLVED_STATUSES),
             })
             logger.info("집계 완료")
+            prune_old_runs(engine)
 
         if args.report is not None:
             print_report(
@@ -987,6 +1020,7 @@ def main(argv=None) -> int:
             "unresolved_cnt": sum(stats[key] for key in UNRESOLVED_STATUSES),
         })
         logger.info("집계 완료")
+        prune_old_runs(engine)
 
     if args.out:
         payload = {
