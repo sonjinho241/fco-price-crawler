@@ -48,7 +48,6 @@ GitHub Actions(공개 저장소 = Actions 분 무제한)에서 매시 한 번 �
     PRICE_LATEST_MAX_RATE       모든 워커를 합친 초당 요청 상한 (기본 4, 5 를 넘기면 5 로 자른다)
     PRICE_LATEST_BUDGET_MIN     다음 버킷을 시작해도 되는 실행 시간 예산(분) (기본 50)
     PRICE_LATEST_NEW_CAP        실행마다 먼저 받는 신규 카드(시세 표에 없는 spid) 상한 (기본 100)
-    PRICE_LATEST_VACUUM_MIN     이 수 이상 행이 바뀐 실행만 VACUUM 한다 (기본 3000, KST 04시 버킷은 항상)
     PRICE_LATEST_CHUNK_SIZE     한 번에 제출/처리하는 (spid,strong) 작업 수 (기본 1300 = 100카드)
     PRICE_LATEST_DB_BATCH       DB 에 한 번에 upsert 하는 행 수 (기본 500)
     PRICE_LATEST_MAX_RETRIES    넥슨 호출 재시도 횟수(429·403 제외) (기본 3)
@@ -479,6 +478,7 @@ HOT_BUCKETS = 24             # 하루 시각(KST 0~23시)
 TAIL_BUCKETS = 168           # 주간 시각(KST 월 00시 = 0 … 일 23시 = 167)
 MAX_CATCHUP = 3              # 실행당 처리하는 버킷 상한. 밀린 버킷을 몰아치지 않는다.
 MAX_LAG = timedelta(days=7)  # 이보다 밀리면 지금 버킷부터 새로 시작한다
+VACUUM_EVERY_HOURS = 6       # KST 04·10·16·22시 버킷이 끝나면 VACUUM (이전 6토막과 같은 하루 4~6회 수준)
 
 
 def bucket_of(spid: int, n: int) -> int:
@@ -776,7 +776,6 @@ def run() -> None:
     max_rate = _env_float("PRICE_LATEST_MAX_RATE", 4.0)
     budget = _env_float("PRICE_LATEST_BUDGET_MIN", 50) * 60
     new_cap = _env_int("PRICE_LATEST_NEW_CAP", 100)
-    vacuum_min = _env_int("PRICE_LATEST_VACUUM_MIN", 3000)
     spid_limit = _env_int("PRICE_LATEST_LIMIT", 0)
     only_new = os.getenv("PRICE_LATEST_ONLY_NEW", "0") == "1"
     full = os.getenv("PRICE_LATEST_FULL", "0") == "1"
@@ -818,7 +817,7 @@ def run() -> None:
                 label = (f"버킷 {bucket_at.astimezone(_KST):%m-%d %H}시 "
                          f"(hot {len(hot_part)} + tail {len(tail_part)})")
                 segments.append((label, hot_part + tail_part, bucket_at))
-                vacuum_hour = vacuum_hour or hot_slot(bucket_at) == 4
+                vacuum_hour = vacuum_hour or hot_slot(bucket_at) % VACUUM_EVERY_HOURS == 4
 
     if spid_limit > 0:  # 스모크 테스트: 앞에서 [limit] 장만 받고 상태 표는 건드리지 않는다
         remaining = spid_limit
@@ -852,8 +851,10 @@ def run() -> None:
         stats.done, stats.written, stats.changed, stats.elapsed(), stats.rate(), gate.throttled,
     )
 
-    # 바뀐 행이 많을 때와 하루 한 번(KST 04시 버킷)만 청소한다. 매시 무조건 돌리면 VACUUM 자체가 IO 다.
-    if stats.changed and (stats.changed >= vacuum_min or vacuum_hour or full):
+    # 6시간에 한 번(KST 04·10·16·22시 버킷)만 청소한다. 스모크에서 받은 행의 66% 가 값이 바뀌어
+    # (현재가는 2시간마다 움직인다) 행 수 임계로는 매시 돌게 된다 — 매시 VACUUM 은 그 자체가 IO 다.
+    # 수동 전 카드·신규 실행은 끝에 한 번 청소한다.
+    if stats.changed and (vacuum_hour or full or only_new):
         try:
             vacuum_analyze(engine)
             logger.info("VACUUM (ANALYZE) 완료: %s.player_price_latest·player_price_strongs", PLAYER_SCHEMA)
