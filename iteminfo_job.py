@@ -165,14 +165,29 @@ def fetched_times(engine) -> Dict[int, object]:
 
 
 def read_local(folder: str, limit: int) -> Tuple[List[Tuple[int, str]], Dict[int, str], List[int]]:
+    """저장해 둔 페이지 → (목록, 페이지, 못 받은 sn). [folder] 가 .json 이면 브라우저 묶음(iteminfo_browser.py)."""
     import pathlib
 
     root = pathlib.Path(folder)
+    if root.suffix.lower() == ".json":
+        return read_bundle(root)
     index = ii.parse_index((root / "index.html").read_text(encoding="utf-8"))
     targets = index[:limit] if limit else index
     pages = {sn: (root / f"s{sn}.html").read_text(encoding="utf-8")
              for sn, _ in targets if (root / f"s{sn}.html").exists()}
-    return index, pages, [sn for sn, _ in targets if sn not in pages]
+    # 폴더에 없는 표는 "안 받은 것"이지 실패가 아니다(새 표만 저장해 오는 게 보통이다).
+    return index, pages, []
+
+
+def read_bundle(path) -> Tuple[List[Tuple[int, str]], Dict[int, str], List[int]]:
+    """브라우저 콘솔 스크립트가 내려받은 {index, pages: {sn: html}, failed} 파일. 받은 표만 담겨 있다."""
+    import pathlib
+
+    data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    if data.get("version") != 1 or "index" not in data:
+        raise SystemExit(f"{path}: 확률표 묶음 파일이 아닙니다")
+    pages = {int(sn): html for sn, html in (data.get("pages") or {}).items()}
+    return ii.parse_index(data["index"]), pages, [int(sn) for sn in data.get("failed") or []]
 
 
 def fetch_pages(fetcher: Fetcher, sns: Sequence[int]) -> Tuple[Dict[int, str], List[int], bool]:
@@ -410,7 +425,8 @@ def run() -> None:
     blocked = False
     if local:
         index, pages, failed = read_local(local, limit)
-        must = [sn for sn, _ in (index[:limit] if limit else index)]
+        # 저장한 표(와 받으려다 못 받은 표)만 판정한다 — 새 표만 저장해 오는 게 보통이다.
+        must = sorted(set(pages) | set(failed))
     else:
         fetcher = Fetcher(delay=delay, budget=budget)
         try:

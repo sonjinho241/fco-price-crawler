@@ -21,3 +21,7 @@ env/
 # 로그/임시
 *.log
 *.tmp
+
+# 브라우저 확률표 받기 스크립트(iteminfo_browser.py snippet 이 만든다 — DB 의 sn 목록이 들어 있다)
+iteminfo_snippet.js
+iteminfo-*.json

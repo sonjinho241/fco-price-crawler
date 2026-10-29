@@ -132,6 +132,27 @@ DB의 `player.player_price_latest` 테이블에 upsert 한다. 이 표 덕분에
 
 ---
 
+## 🤖 운영 요약 — 확률표·후보 풀 배치(`iteminfo_job.py`)
+
+- **언제**: `iteminfo.yml`, 매일 18:30 KST + 목 17~23시 KST 매시(GitHub cron 지연으로 몇 시간 늦게 돈다).
+- **무엇을 받나**: 넥슨 목록에서 새 표 + 콘솔 등록 상품·회차에서 닿는 표 + 오래된 표 50개를 한 번에 하나씩,
+  1~2초 간격으로 받는다(2026-10-29 `b7a7d9e`). 후보 풀은 등록 상품·회차에서 닿는 Top Price 표만 만든다.
+- ⚠️ **2026-10-29 부터 넥슨(Cloudflare)이 러너의 자동 수집을 20회 안팎에서 429 로 막는다.** 간격을 늘려도
+  20회 언저리에서 막혀 몇 분 넘게 풀리지 않는다(1시간 뒤 실행은 다시 20회쯤 받는다). 이미 받은 표로
+  후보 풀은 만들지만 **새 표를 놓치면 실패(exit 1)** 로 끝난다.
+- **새 표를 놓쳤을 때 — 브라우저로 받아 넣기** (`iteminfo_browser.py`, 사람 한 명의 조회 속도):
+  1. `DATABASE_URL=... python iteminfo_browser.py snippet` → `iteminfo_snippet.js`(DB 에 있는 sn 을 넣어 새 표만 받는다.
+     이미 있는 표를 다시 받으려면 `--also 25394,25395`).
+  2. 크롬에서 `https://iteminfo.nexon.com/probability/fco` → F12 → Console 에 붙여 넣기. 표마다 3~5초 쉬고
+     429 면 1분 쉰다. 끝나면 `iteminfo-<날짜>.json` 을 내려받는다(진행은 탭 제목).
+  3. `DATABASE_URL=... ITEMINFO_LOCAL_DIR=<받은 .json 경로> python iteminfo_job.py` — 저장한 표만 비교해 쓰고
+     후보 풀을 다시 만든다. 실패 판정도 저장한 표 기준이다.
+  - `DATABASE_URL` 은 크롤러용 주소(세션 모드 :5432, GitHub Secret 과 같은 값). 스크립트·묶음 파일은 `.gitignore`.
+  - 로컬 파이썬으로 넥슨을 직접 부르면 403 이다(브라우저 아닌 요청). 브라우저 위장·IP 돌리기로 우회하지 않는다 —
+    넥슨이 일부러 건 제한이라 더 넓게 막히면 정상 경로까지 잃는다.
+
+---
+
 ## 구조
 
 ```
