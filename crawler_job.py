@@ -38,6 +38,7 @@ FC Online 선수 "최신 시세만" 일일 크롤러 — 공개 저장소용 자
     PRICE_LATEST_MAX_RETRIES    넥슨 호출 재시도 횟수 (기본 3)
     PRICE_LATEST_REQUEST_DELAY  각 요청 후 sleep 초 (기본 0.05, 레이트리밋 완화용)
     PRICE_LATEST_LIMIT          처리할 spid 수 상한 (기본 0=전체; 샤딩 전에 적용, 테스트용)
+    PRICE_LATEST_ONLY_NEW       1 이면 player_price_strongs 에 없는 spid(신규 카드)만 (기본 0)
 
 로컬 테스트:
     DATABASE_URL=postgresql://... PRICE_LATEST_LIMIT=20 PRICE_LATEST_STRONGS=1 python crawler_job.py
@@ -208,6 +209,17 @@ def make_engine():
 def read_spids(conn) -> List[int]:
     """검색 가능한 선수(players 테이블)의 spid 전체를 정렬해 반환."""
     rows = conn.execute(text(f"SELECT DISTINCT spid FROM {PLAYERS_TABLE}")).all()
+    return sorted({row[0] for row in rows})
+
+
+def read_new_spids(conn) -> List[int]:
+    """시세 표(player_price_strongs)에 아직 한 줄도 없는 spid. 신규 시즌이 들어온 날 6토막이
+    한 바퀴 돌기 전에 새 카드만 먼저 채우는 수동 실행용(2026-10-29 26UP 출시 주 — 새 카드
+    시세가 없으면 개봉 시뮬레이터 상품이 통째로 숨겨진다)."""
+    rows = conn.execute(text(
+        f"SELECT DISTINCT p.spid FROM {PLAYERS_TABLE} p "
+        f"WHERE NOT EXISTS (SELECT 1 FROM {PLAYER_SCHEMA}.player_price_strongs s WHERE s.spid = p.spid)"
+    )).all()
     return sorted({row[0] for row in rows})
 
 
@@ -476,6 +488,7 @@ def run() -> None:
     max_retries = _env_int("PRICE_LATEST_MAX_RETRIES", 3)
     delay = float(os.getenv("PRICE_LATEST_REQUEST_DELAY", "0.05") or 0)
     spid_limit = _env_int("PRICE_LATEST_LIMIT", 0)
+    only_new = os.getenv("PRICE_LATEST_ONLY_NEW", "0") == "1"
 
     # 동시 요청 수만큼 커넥션 풀을 키운다(HTTP 는 워커 스레드에서만 일어난다).
     session = make_session()
@@ -490,7 +503,9 @@ def run() -> None:
     # spid 목록만 읽고 커넥션을 바로 돌려준다. 이후 쓰기는 flush 마다 새로 체크아웃한다
     # (bulk_upsert_latest 주석 참고).
     with engine.connect() as conn:
-        all_spids = read_spids(conn)
+        all_spids = read_new_spids(conn) if only_new else read_spids(conn)
+    if only_new:
+        logger.info("신규 카드만: 시세 표에 없는 spid %d개", len(all_spids))
     if spid_limit > 0:                       # 테스트용 상한은 샤딩 전에 적용
         all_spids = all_spids[:spid_limit]
     spids = _shard(all_spids)

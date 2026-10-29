@@ -36,6 +36,10 @@ on:
         description: "각 요청 후 sleep 초(레이트리밋 완화)"
         required: false
         default: "0.05"
+      only_new:
+        description: "신규 카드만(시세 표에 없는 spid만, 1=예). 신규 시즌 출시일용"
+        required: false
+        default: "0"
 
 # 최소권한. ⚠️ pull_request 트리거는 절대 추가하지 말 것(외부 fork 의 시크릿 노출 방지).
 permissions:
@@ -99,4 +103,5 @@ jobs:
           PRICE_LATEST_WORKERS: ${{ github.event.inputs.workers || '10' }}
           PRICE_LATEST_REQUEST_DELAY: ${{ github.event.inputs.request_delay || '0.05' }}
           PRICE_LATEST_LIMIT: ${{ github.event.inputs.limit || '0' }}
+          PRICE_LATEST_ONLY_NEW: ${{ github.event.inputs.only_new || '0' }}
         run: python crawler_job.py
