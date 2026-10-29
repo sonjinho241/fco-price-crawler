@@ -1,27 +1,28 @@
 name: crawl-prices
 
-# 넥슨 시세는 하루 1회 갱신이라 1일 1회가 의미 있는 최대치다.
+# 넥슨 시세(PlayerPriceGraph) → player_price_latest·player_price_strongs.
 # 공개 저장소이므로 GitHub Actions 분(分)은 무제한 → 비용 0원.
 #
-# ⚙️ Disk IO 예산 대응: 예전엔 새벽 한 창(20:00 UTC)에 4 샤드를 "동시에" 돌려
-#    Supabase 에 IO 를 몰아 태웠다(2h 폭주 → 크레딧 소진). 이제는 하루를
-#    6 토막(4시간 간격)으로 펴서, 각 토막이 전체 spid 의 1/6 만 담당한다.
-#    동시 커넥션 4→1, 순간 IO 가 baseline 밑으로 깔려 예산이 안 깎인다.
-#    넥슨이 하루 1회 갱신이라 24h 안에 한 바퀴만 돌면 신선도는 동일.
+# ⚙️ 2026-10-30 부터 매시 한 번, 낮은 속도(전체 4 req/s 이하, 상한 5)로 조금씩 돈다.
+#    예전엔 전 카드를 하루 6토막에 나눠 토막마다 35 req/s 로 92분 몰아서 보냈다(하루 116만 건).
+#    2026-10-29 넥슨(Cloudflare)이 GitHub 러너의 iteminfo 수집을 429 로 막아 요청량과 시간 분포를 바꿨다.
+#    hot(조회·스쿼드·팩 후보 카드)은 24시간, 나머지 tail 은 168시간에 한 바퀴(하루 약 22만 건).
+#    어느 버킷을 돌지는 crawler_job.py 가 player.price_crawl_state 를 보고 정한다(밀리면 실행당 최대 3버킷).
+#    설계: 메인 저장소 docs/price-crawl-two-tier-plan.md
 on:
   schedule:
-    # UTC 기준, 4시간 간격 6 토막. 각 cron → 아래 "Resolve shard" 의 샤드 인덱스.
-    # ⚠️ cron 목록을 바꾸면 아래 case 매핑과 SHARD_COUNT 를 반드시 함께 맞출 것.
-    - cron: "0 20 * * *"   # → shard 0 (KST 05:00)
-    - cron: "0 0 * * *"    # → shard 1 (KST 09:00)
-    - cron: "0 4 * * *"    # → shard 2 (KST 13:00)
-    - cron: "0 8 * * *"    # → shard 3 (KST 17:00)
-    - cron: "0 12 * * *"   # → shard 4 (KST 21:00)
-    - cron: "0 16 * * *"   # → shard 5 (KST 01:00)
+    # 정각은 GitHub 혼잡 시간이라 피한다. cron 이 늦거나 빠져도 다음 실행이 밀린 버킷을 메운다.
+    - cron: "7 * * * *"
   workflow_dispatch:
     inputs:
+      mode:
+        description: "bucket=매시 실행과 같음 / only_new=시세 표에 없는 카드 전부 / full=전 카드(5 req/s 상한이라 한 번에 안 끝난다)"
+        required: false
+        default: "bucket"
+        type: choice
+        options: [bucket, only_new, full]
       limit:
-        description: "테스트용 spid 수 상한 (0=전체)"
+        description: "스모크용 spid 수 상한 (0=전체). 0 이 아니면 상태 표를 건드리지 않는다"
         required: false
         default: "0"
       strongs:
@@ -31,21 +32,17 @@ on:
       workers:
         description: "동시 요청 스레드 수"
         required: false
-        default: "10"
-      request_delay:
-        description: "각 요청 후 sleep 초(레이트리밋 완화)"
+        default: "3"
+      max_rate:
+        description: "전체 초당 요청 상한 (5 를 넘기면 5)"
         required: false
-        default: "0.05"
-      only_new:
-        description: "신규 카드만(시세 표에 없는 spid만, 1=예). 신규 시즌 출시일용"
-        required: false
-        default: "0"
+        default: "4"
 
 # 최소권한. ⚠️ pull_request 트리거는 절대 추가하지 말 것(외부 fork 의 시크릿 노출 방지).
 permissions:
   contents: read
 
-# 실행이 겹치지 않게(이전 토막이 길어지면 다음 cron 은 대기).
+# 실행이 겹치지 않게(이전 실행이 길어지면 다음 cron 은 대기, 대기 중인 것은 최신 하나만 남는다).
 concurrency:
   group: crawl-prices
   cancel-in-progress: false
@@ -53,8 +50,8 @@ concurrency:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    # 단일 job 6시간 제한 회피용 안전 상한. 한 토막은 1/6 분량이라 실제로는 훨씬 짧다.
-    timeout-minutes: 200
+    # 매시 실행은 50분 예산 안에서만 다음 버킷을 시작한다. 수동 only_new·full 은 길게 둔다.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.mode == 'bucket') && 75 || 350 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -68,40 +65,14 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      # 어떤 cron 이 트리거했는지(github.event.schedule)로 이번에 돌릴 샤드를 정한다.
-      # 수동 실행(workflow_dispatch)은 schedule 이 비어 있으므로 전체 1회로 돈다.
-      - name: Resolve shard from schedule
-        id: slot
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            count=6
-            case "${{ github.event.schedule }}" in
-              "0 20 * * *") idx=0 ;;
-              "0 0 * * *")  idx=1 ;;
-              "0 4 * * *")  idx=2 ;;
-              "0 8 * * *")  idx=3 ;;
-              "0 12 * * *") idx=4 ;;
-              "0 16 * * *") idx=5 ;;
-              *)            idx=0 ;;   # 매핑 누락 시 안전 기본값
-            esac
-          else
-            # 수동 실행: 샤딩 없이 전체 spid 1회.
-            count=1
-            idx=0
-          fi
-          echo "shard_index=$idx" >> "$GITHUB_OUTPUT"
-          echo "shard_count=$count" >> "$GITHUB_OUTPUT"
-          echo "이번 실행: shard $idx / $count (event=${{ github.event_name }}, schedule='${{ github.event.schedule }}')"
-
-      - name: Crawl shard ${{ steps.slot.outputs.shard_index }}/${{ steps.slot.outputs.shard_count }}
+      - name: Crawl (${{ inputs.mode || 'bucket' }})
         env:
           # 🔒 DB 접속문자열(주소+비밀번호)은 코드에 절대 두지 않는다. Secret 으로만 주입.
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          SHARD_INDEX: ${{ steps.slot.outputs.shard_index }}
-          SHARD_COUNT: ${{ steps.slot.outputs.shard_count }}
-          PRICE_LATEST_STRONGS: ${{ github.event.inputs.strongs || '1-13' }}
-          PRICE_LATEST_WORKERS: ${{ github.event.inputs.workers || '10' }}
-          PRICE_LATEST_REQUEST_DELAY: ${{ github.event.inputs.request_delay || '0.05' }}
-          PRICE_LATEST_LIMIT: ${{ github.event.inputs.limit || '0' }}
-          PRICE_LATEST_ONLY_NEW: ${{ github.event.inputs.only_new || '0' }}
+          PRICE_LATEST_STRONGS: ${{ inputs.strongs || '1-13' }}
+          PRICE_LATEST_WORKERS: ${{ inputs.workers || '3' }}
+          PRICE_LATEST_MAX_RATE: ${{ inputs.max_rate || '4' }}
+          PRICE_LATEST_LIMIT: ${{ inputs.limit || '0' }}
+          PRICE_LATEST_ONLY_NEW: ${{ inputs.mode == 'only_new' && '1' || '0' }}
+          PRICE_LATEST_FULL: ${{ inputs.mode == 'full' && '1' || '0' }}
         run: python crawler_job.py

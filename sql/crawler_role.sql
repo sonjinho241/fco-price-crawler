@@ -77,3 +77,13 @@ grant select                         on spend.product         to fco_crawler;
 -- 2026-10-19: 교환·절구 보상 규칙이 회차(spend.event) config 로 옮겨 갔다. 앱 서버 BOOTSTRAP 27 이 적용한다.
 grant select                         on spend.event           to fco_crawler;
 grant select                         on player.seasonid       to fco_crawler;
+
+-- 8) 시세 배치 두 묶음(crawler_job.py) 권한 — 2026-10-30 추가.
+--    표 정의와 같은 grant 가 메인 저장소 scripts/price_crawl_state.sql 에도 있다(grant 는 멱등).
+--    상태 표: 마지막으로 끝낸 시각 버킷 한 행.
+grant select, insert, update on player.price_crawl_state to fco_crawler;
+--    hot 출처: 최근 7일 조회, 서버 동기화 스쿼드, 팩 후보 풀(spend.* 는 위 7번에 이미 있다).
+--    squads 는 사용자 데이터라 표 전체가 아니라 읽는 두 컬럼만 연다.
+grant select on player.player_view_daily to fco_crawler;
+grant usage  on schema app_user to fco_crawler;
+grant select (members, deleted_at) on app_user.squads to fco_crawler;
