@@ -3,7 +3,8 @@
 
 FCO 매니저 '현질 도우미'의 원천 데이터. 하루 1회 돈다(넥슨이 목요일 점검 때 상품을 바꾼다).
 
-1. 목록(iteminfo.nexon.com/probability/fco)과 표 301개 안팎을 받는다.
+1. 목록(iteminfo.nexon.com/probability/fco)을 받고, 표는 새 표·등록 상품에서 닿는 표 + 오래된 표 일부만
+   한 번에 하나씩 받는다(Fetcher·plan_targets — 2026-10-29 넥슨 429 이후). 전부 받으려면 ITEMINFO_FORCE=1.
    Cloudflare 가 브라우저 헤더 없는 요청에 403 을 준다 → BROWSER_HEADERS 필수.
 2. 표마다 해시를 비교해 **바뀐 표만** 행을 갈아 쓴다. 전량 16만 행을 매일 다시 쓰면
    Disk IO 예산을 태운다(2026-07 사고). 행은 JSON 문자열 하나로 바인드한다.
@@ -11,13 +12,15 @@ FCO 매니저 '현질 도우미'의 원천 데이터. 하루 1회 돈다(넥슨�
 4. 운영자가 콘솔에 등록한 상품(spend.product)·이벤트 회차(spend.event)에서 닿는 Top Price 표만 후보 풀
    초안을 만든다. 등록돼 있으면 끔·미리보기·종료일 지남과 상관없이 대상이고, 콘솔에서 삭제하면 다음
    실행부터 대상에서 빠진다(2026-10-26 사용자 결정 — 판매를 내리는 건 운영자가 삭제로만 한다).
-   확률표 자체(1~3)는 등록과 상관없이 넥슨 목록 전체를 받는다 — 콘솔이 그 표에서 sn 을 골라 등록하기 때문.
+   확률표 자체(1~3)는 등록과 상관없이 새 표를 모두 받는다 — 콘솔이 그 표에서 sn 을 골라 등록하기 때문.
    조건 = 등급칸 클래스 · 제목의 강화 범위 · 최종 OVR 하한. 최종 OVR = 기본 OVR + 강화 보너스
    (2026-10-13 넥슨 최종 OVR 표 1,142장과 대조해 전부 일치). 카드 목록이 바뀌면 확정을 푼다 —
    운영자가 확정한 풀만 앱에 기댓값이 공개된다.
 
 환경변수: DATABASE_URL(필수), ITEMINFO_LIMIT(테스트용 표 수 상한, 0=전체),
-          ITEMINFO_WORKERS(기본 4), ITEMINFO_FORCE=1(해시 무시하고 전부 다시 쓰기),
+          ITEMINFO_ROTATE(새 표·등록 상품 표 말고 돌아가며 받을 옛 표 수, 기본 50),
+          ITEMINFO_DELAY(요청 간격 최소 초, 기본 1 — 1~2배 무작위), ITEMINFO_BUDGET_SEC(수집 시간 상한, 기본 1500),
+          ITEMINFO_FORCE=1(목록 전체를 받고 해시 무시하고 전부 다시 쓰기),
           ITEMINFO_LOCAL_DIR(넥슨 대신 저장해 둔 index.html·s<sn>.html 폴더에서 읽기 — 오프라인 검증용)
 """
 from __future__ import annotations
@@ -26,9 +29,9 @@ import hashlib
 import json
 import logging
 import os
+import random
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import requests
@@ -65,18 +68,100 @@ def make_session() -> requests.Session:
     return s
 
 
-def fetch(session: requests.Session, url: str, retries: int = 3) -> str:
-    last: Optional[Exception] = None
-    for attempt in range(retries):
-        try:
-            res = session.get(url, timeout=60)
-            if res.status_code == 200:
+class Blocked(RuntimeError):
+    """넥슨이 429 를 계속 준다 — 이번 실행의 수집을 멈춘다."""
+
+
+class Fetcher:
+    """넥슨에 한 번에 하나씩, 요청 사이 [delay]~2×[delay] 초를 쉬며 묻는다.
+
+    2026-10-29 부터 넥슨(Cloudflare)이 GitHub 러너의 4개 동시 요청에 429 를 줬다(297개 중 21개만 받음).
+    429 는 Retry-After(없으면 30·60·120초)만큼 쉬고 다시 묻고, 그래도 막히면 [Blocked] 로 멈춘다 —
+    막힌 채 계속 두드리면 더 오래 막힌다. 그 밖의 오류는 2·4초 쉬고 세 번까지 묻는다.
+    [budget] 초가 지나면 남은 표는 다음 실행에 넘긴다.
+    """
+
+    BACKOFF = (30, 60, 120)
+
+    def __init__(self, session=None, delay: float = 1.0, budget: float = 1500,
+                 sleep=time.sleep, clock=time.monotonic, rand=random.random):
+        self.session = session or make_session()
+        self.delay, self.budget = delay, budget
+        self.sleep, self.clock, self.rand = sleep, clock, rand
+        self.started = clock()
+        self.first = True
+        self.throttled = 0  # 429 를 받은 횟수(로그용)
+
+    def out_of_time(self) -> bool:
+        return self.clock() - self.started > self.budget
+
+    def _pause(self) -> None:
+        if not self.first:
+            self.sleep(self.delay * (1 + self.rand()))
+        self.first = False
+
+    def get(self, url: str) -> str:
+        self._pause()
+        backoff = 0
+        last: Optional[str] = None
+        attempt = 0
+        while True:
+            try:
+                res = self.session.get(url, timeout=60)
+            except requests.RequestException as exc:
+                res, last = None, str(exc)
+            if res is not None and res.status_code == 200:
                 return res.text
-            last = RuntimeError(f"HTTP {res.status_code}")
-        except requests.RequestException as exc:
-            last = exc
-        time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"{url}: {last}")
+            if res is not None and res.status_code == 429:
+                self.throttled += 1
+                if backoff >= len(self.BACKOFF):
+                    raise Blocked(f"{url}: HTTP 429 가 계속됩니다")
+                wait = _retry_after(res.headers.get("Retry-After"), self.BACKOFF[backoff])
+                backoff += 1
+                log.warning("429 — %s초 쉬고 다시 묻습니다: %s", wait, url)
+                self.sleep(wait)
+                continue
+            if res is not None:
+                last = f"HTTP {res.status_code}"
+            attempt += 1
+            if attempt >= 3:
+                raise RuntimeError(f"{url}: {last}")
+            self.sleep(2 * attempt)
+
+
+def _retry_after(raw: Optional[str], default: int) -> int:
+    """Retry-After 초(숫자만 믿는다). 없거나 이상하면 [default], 너무 길면 5분으로 자른다."""
+    try:
+        return max(1, min(300, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+def plan_targets(index: Sequence[Tuple[int, str]], fetched_at: Dict[int, object], reach: set,
+                 rotate: int) -> Tuple[List[int], List[int]]:
+    """받을 표를 고른다 → (꼭 받을 표, 돌아가며 받을 표).
+
+    꼭 받을 표 = 목록에 새로 생긴 표(DB 에 없음) + 콘솔에 등록된 상품·회차에서 닿는 표(앱이 쓰는 표).
+    나머지는 가장 오래전에 받은 [rotate] 개만 받는다 — 평소엔 거의 안 바뀌는데 매번 300개 가까이
+    물으면 넥슨이 막는다. 목록에서 빠진 표는 묻지 않는다.
+    """
+    sns = [sn for sn, _ in index]
+    new = [sn for sn in sns if sn not in fetched_at]
+    reached = [sn for sn in sns if sn in reach and sn in fetched_at]
+    must = set(new) | set(reached)
+    rest = sorted((sn for sn in sns if sn not in must), key=lambda sn: (str(fetched_at[sn]), sn))
+    return new + reached, rest[:max(0, rotate)]
+
+
+def reachable_sns(engine) -> set:
+    """콘솔에 등록된 상품·회차에서 하위 상자를 따라 닿는 표 전부(종류 무관)."""
+    with engine.connect() as conn:
+        return {int(sn) for (sn,) in conn.execute(text(REACH_CTE + "SELECT sn FROM reach WHERE sn IS NOT NULL"))}
+
+
+def fetched_times(engine) -> Dict[int, object]:
+    with engine.connect() as conn:
+        return {int(sn): at for sn, at in conn.execute(text("SELECT sn, fetched_at FROM spend.prob_table"))}
 
 
 def read_local(folder: str, limit: int) -> Tuple[List[Tuple[int, str]], Dict[int, str], List[int]]:
@@ -90,29 +175,23 @@ def read_local(folder: str, limit: int) -> Tuple[List[Tuple[int, str]], Dict[int
     return index, pages, [sn for sn, _ in targets if sn not in pages]
 
 
-def fetch_all(limit: int, workers: int) -> Tuple[List[Tuple[int, str]], Dict[int, str], List[int]]:
-    session = make_session()
-    index = ii.parse_index(fetch(session, BASE))
-    if not index:
-        raise SystemExit("확률표 목록이 비었습니다 — 넥슨 페이지 구조가 바뀌었는지 확인하세요.")
-    targets = index[:limit] if limit else index
+def fetch_pages(fetcher: Fetcher, sns: Sequence[int]) -> Tuple[Dict[int, str], List[int], bool]:
+    """[sns] 를 차례로 받는다 → (받은 페이지, 못 받은 sn, 막혀서 멈췄는지). 멈춘 뒤의 sn 도 못 받은 쪽에 넣는다."""
     pages: Dict[int, str] = {}
     failed: List[int] = []
-
-    def one(sn: int):
+    for i, sn in enumerate(sns):
+        if fetcher.out_of_time():
+            log.warning("시간 예산을 넘겨 남은 표 %s개는 다음 실행에 받습니다", len(sns) - i)
+            return pages, failed + list(sns[i:]), True
         try:
-            return sn, fetch(make_session(), f"{BASE}?sn={sn}")
-        except Exception as exc:  # noqa: BLE001 — 실패 sn 은 다음 날 다시 받는다
+            pages[sn] = fetcher.get(f"{BASE}?sn={sn}")
+        except Blocked as exc:
+            log.warning("넥슨이 계속 막아 수집을 멈춥니다(남은 %s개): %s", len(sns) - i, exc)
+            return pages, failed + list(sns[i:]), True
+        except Exception as exc:  # noqa: BLE001 — 실패 sn 은 다음 실행에 다시 받는다
             log.warning("sn=%s 실패: %s", sn, exc)
-            return sn, None
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for sn, page in pool.map(lambda item: one(item[0]), targets):
-            if page is None:
-                failed.append(sn)
-            else:
-                pages[sn] = page
-    return index, pages, failed
+            failed.append(sn)
+    return pages, failed, False
 
 
 # ---- DB 쓰기 ---------------------------------------------------------------
@@ -320,13 +399,38 @@ def sync_pool(engine, sn: int, spec: ii.PoolSpec) -> dict:
 def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     limit = _env_int("ITEMINFO_LIMIT", 0)
-    workers = _env_int("ITEMINFO_WORKERS", 4)
+    rotate = _env_int("ITEMINFO_ROTATE", 50)
+    delay = float(os.environ.get("ITEMINFO_DELAY") or 1.0)
+    budget = _env_int("ITEMINFO_BUDGET_SEC", 1500)
     force = os.environ.get("ITEMINFO_FORCE") == "1"
 
-    local = os.environ.get("ITEMINFO_LOCAL_DIR")
-    index, pages, failed = read_local(local, limit) if local else fetch_all(limit, workers)
-    titles = ii.TitleIndex(index)
     engine = make_engine()
+    local = os.environ.get("ITEMINFO_LOCAL_DIR")
+    must: List[int] = []
+    blocked = False
+    if local:
+        index, pages, failed = read_local(local, limit)
+        must = [sn for sn, _ in (index[:limit] if limit else index)]
+    else:
+        fetcher = Fetcher(delay=delay, budget=budget)
+        try:
+            index = ii.parse_index(fetcher.get(BASE))
+        except Blocked as exc:
+            raise SystemExit(f"확률표 목록부터 막혔습니다 — 다음 실행에 다시 받습니다: {exc}")
+        if not index:
+            raise SystemExit("확률표 목록이 비었습니다 — 넥슨 페이지 구조가 바뀌었는지 확인하세요.")
+        if force:
+            must, extra = [sn for sn, _ in index], []
+        else:
+            must, extra = plan_targets(index, fetched_times(engine), reachable_sns(engine), rotate)
+        if limit:
+            must, extra = must[:limit], extra[:max(0, limit - len(must))]
+        print(f"[iteminfo] 받을 표: 새 표·등록 상품에서 닿는 표 {len(must)} + 돌아가며 {len(extra)} "
+              f"(목록 {len(index)}, 동시 1개·간격 {delay:g}~{2 * delay:g}초)")
+        pages, failed, blocked = fetch_pages(fetcher, must + extra)
+        if fetcher.throttled:
+            print(f"[iteminfo] 429 {fetcher.throttled}번")
+    titles = ii.TitleIndex(index)
     with engine.connect() as conn:
         stored = _stored_hashes(conn)
 
@@ -363,7 +467,9 @@ def run() -> None:
     for sn, spec in specs.items():
         pools.append(sync_pool(engine, sn, spec))
 
-    print(f"[iteminfo] 목록 {len(index)} · 받음 {len(pages)} · 실패 {failed or '-'}")
+    missed = [sn for sn in must if sn not in pages]
+    print(f"[iteminfo] 목록 {len(index)} · 받음 {len(pages)} · 실패 {failed or '-'}"
+          f"{' · 막혀서 멈춤' if blocked else ''}")
     print(f"[iteminfo] 바뀐 표 {len(changed)} · 그대로 {len(unchanged)} · 해석 실패 {parse_failed or '-'}")
     print(f"[iteminfo] 카드 spid 채움 {resolved} · 못 찾음 {unresolved_cards}")
     for line in ambiguous:
@@ -377,7 +483,11 @@ def run() -> None:
         if p["unresolved_codes"]:
             flag.append(f"모르는 클래스 {p['unresolved_codes']}")
         print(f"[iteminfo] 풀 {p['sn']}: 후보 {p['eligible']}장 / TOP {p['top_n']} {' · '.join(flag)}")
-    if parse_failed or len(pages) < len(index[:limit] if limit else index) // 2:
+    # 실패 = 꼭 받을 표(새 표·앱이 쓰는 표)를 못 받았거나 해석이 깨졌을 때만. 돌아가며 받는 옛 표는
+    # 다음 실행이 이어받으므로 실패로 치지 않는다 — 빨간 표시가 "새 상품을 놓쳤다"는 신호가 되게.
+    if missed:
+        print(f"[iteminfo] 꼭 받을 표 중 못 받음 {len(missed)}개: {missed}")
+    if parse_failed or missed:
         sys.exit(1)
 
 
