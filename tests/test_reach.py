@@ -38,6 +38,11 @@ class ReachTest(unittest.TestCase):
         self.assertIn("(g->>'sn')::int", REACH_CTE)
         self.assertIn("t->'outcomes'", REACH_CTE)
 
+    def test_flow_script_boxes_and_tables(self):
+        # script 게임(열쇠 상점 교환소 등)은 sns·tables 로만 상자를 준다 — 빠지면 그 아래 Top Price 풀이 안 생긴다.
+        self.assertIn("g->'sns'", REACH_CTE)
+        self.assertIn("g->'tables'", REACH_CTE)
+
 
 if __name__ == "__main__":
     unittest.main()

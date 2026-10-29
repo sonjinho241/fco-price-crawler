@@ -241,6 +241,10 @@ REACH_CTE = (
     "    jsonb_array_elements(coalesce(live_event.config->'games', '[]'::jsonb)) AS g, "
     "    jsonb_array_elements(coalesce(g->'tiers', '[]'::jsonb)) AS t, "
     "    jsonb_array_elements(coalesce(t->'outcomes', '[]'::jsonb)) AS o "
+    # script 게임: 줄 수 있는 상자(sns)와 턴 안에서 여는 확률표(tables). 2026-10-29 열쇠 상점에서 빠져 있던 것.
+    "  UNION SELECT s.sn::int FROM live_event, "
+    "    jsonb_array_elements(coalesce(live_event.config->'games', '[]'::jsonb)) AS g, "
+    "    jsonb_array_elements_text(coalesce(g->'sns', '[]'::jsonb) || coalesce(g->'tables', '[]'::jsonb)) AS s(sn) "
     "  UNION SELECT c.sn::int FROM live, "
     "    jsonb_array_elements(coalesce(live.config->'cells', '[]'::jsonb)) AS cell, "
     "    jsonb_array_elements_text(cell->'choice_sns') AS c(sn) "
