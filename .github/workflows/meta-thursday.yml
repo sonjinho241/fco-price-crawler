@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: "스모크 테스트용 spid 수 상한 (dispatch 는 ONLY_NEW 게이트 없이 앞에서부터 limit 장 크롤)"
+        description: "스모크 테스트용 spid 수 상한 (dispatch 는 ONLY_NEW 게이트 없이 앞에서부터 limit 장 크롤). 0 = 실전 실행(신규만 즉시 반영)"
         required: false
         default: "30"
 
@@ -82,8 +82,9 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           META_MODE: crawl
-          # dispatch(스모크)는 신규가 없어도 돌 수 있게 ONLY_NEW 를 끄고 limit 으로 제한
-          META_ONLY_NEW: ${{ github.event_name == 'workflow_dispatch' && '0' || '1' }}
+          # dispatch(스모크)는 신규가 없어도 돌 수 있게 ONLY_NEW 를 끄고 limit 으로 제한.
+          # 단 limit=0 dispatch 는 예약 실행과 같은 실전 실행(신규만) — 폴링을 기다리지 않고 바로 반영할 때.
+          META_ONLY_NEW: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.limit != '0') && '0' || '1' }}
           META_LIMIT: ${{ github.event.inputs.limit || '0' }}
         run: python meta_crawler.py
       # 방금 들어온 카드 중 player_career 에 없는 선수만. 앞 단계가 일부 실패해도

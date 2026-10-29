@@ -464,15 +464,21 @@ def _write_github_output(**kwargs) -> None:
 # 시즌 필터는 strSeason 이고 값이 ",879," 처럼 앞뒤 콤마다(DataCenter.SetCheckSearch 가
 # 그렇게 만든다. "879" 만 보내면 0건). 페이지는 n4PageNo, 행 식별자는 area_playerunit_{spid}.
 _SEED_RECENT_SEASONS = 10        # 시드 대상은 seasonid 상위 N개 중 spid 0개인 시즌만(옛 빈 시즌 제외)
-_SEED_MAX_PAGES = 300            # 시즌 하나가 수백 장이라 페이지 상한(안전장치)
+_DATACENTER_LIST_CAP = 200       # PlayerList 한 번에 오는 최대 장수(페이지 넘김 없음)
+_SALARY_MIN, _SALARY_MAX = 0, 99  # 상한에 닿으면 이 급여 구간을 반씩 나눠 다시 묻는다
+_OVR_MIN, _OVR_MAX = 1, 199        # 급여 한 값에서도 닿으면 OVR 구간을 반씩 나눈다
+_SEED_MAX_CARDS = 1000            # 이보다 큰 시즌은 시드하지 않는다(재발행된 LIVE 등, 사람이 판단)
 _PLAYERUNIT_RE = re.compile(r"area_playerunit_(\d+)")
 
 # 시드 후보: 최근 시즌 중 player.spid 에 한 건도 없는 시즌. 8.8만 행 정수 나눗셈 1회라 가볍다.
 _SEASONS_WITHOUT_SPIDS_SQL = text(f"""
     SELECT s.season_id, s.class_name
     FROM (
+        (SELECT season_id, class_name FROM {PLAYER_SCHEMA}.seasonid
+         ORDER BY season_id DESC LIMIT :recent)
+        UNION
         SELECT season_id, class_name FROM {PLAYER_SCHEMA}.seasonid
-        ORDER BY season_id DESC LIMIT :recent
+        WHERE season_id = ANY(CAST(:extra AS integer[]))
     ) s
     WHERE NOT EXISTS (
         SELECT 1 FROM {PLAYER_SCHEMA}.spid p
@@ -483,10 +489,17 @@ _SEASONS_WITHOUT_SPIDS_SQL = text(f"""
 
 
 def fetch_player_list_page(session: requests.Session, season_id: int, page: int,
-                           timeout: int = 20) -> str:
+                           timeout: int = 20,
+                           salary: Optional[Tuple[int, int]] = None,
+                           ovr: Optional[Tuple[int, int]] = None) -> str:
+    data = {"strSeason": f",{season_id},", "n4PageNo": page}
+    if salary is not None:
+        data["n4SalaryMin"], data["n4SalaryMax"] = salary
+    if ovr is not None:
+        data["n4OvrMin"], data["n4OvrMax"] = ovr
     res = session.post(
         PLAYER_LIST_URL,
-        data={"strSeason": f",{season_id},", "n4PageNo": page},
+        data=data,
         headers={"Referer": DATACENTER_URL, "X-Requested-With": "XMLHttpRequest"},
         timeout=timeout,
     )
@@ -518,25 +531,82 @@ def parse_player_list(html: str, season_id: int) -> Dict[int, str]:
     return result
 
 
+class _TooManyCards(Exception):
+    pass
+
+
 def fetch_season_spids_from_datacenter(session: requests.Session, season_id: int) -> Dict[int, str]:
-    """시즌 하나의 spid 전부를 페이지 끝까지 긁는다. 새 spid 가 안 나오면 끝."""
+    """시즌 하나의 spid 전부를 긁는다. 요청이 하나라도 실패하면 빈 dict(반쪽 시드 방지 —
+    spid 가 한 건이라도 들어가면 그 시즌은 다음 폴링의 시드 후보에서 빠진다).
+
+    데이터센터는 검색 한 번에 최대 _DATACENTER_LIST_CAP 장만 주고 n4PageNo 는 무시한다
+    (2026-10-29 실측: 26UP 205장이 1·2·3페이지 모두 같은 200장). 상한에 닿으면 급여
+    구간을 반으로 나눠 다시 묻고, 급여 한 값에서도 닿으면(LIVE 시즌은 수천 장) OVR 구간을
+    나눈다.
+    """
     found: Dict[int, str] = {}
-    for page in range(1, _SEED_MAX_PAGES + 1):
-        try:
-            html = fetch_player_list_page(session, season_id, page)
-        except requests.RequestException as exc:
-            logger.warning("시드 시즌=%s 페이지=%d 실패: %s", season_id, page, exc)
-            break
-        page_items = parse_player_list(html, season_id)
-        before = len(found)
-        found.update(page_items)
-        if not page_items or len(found) == before:
-            break
+
+    def collect(salary: Tuple[int, int], ovr: Optional[Tuple[int, int]]) -> None:
+        html = fetch_player_list_page(session, season_id, 1, salary=salary, ovr=ovr)
+        items = parse_player_list(html, season_id)
         time.sleep(0.3)
+        if len(items) >= _DATACENTER_LIST_CAP:
+            if salary[0] < salary[1]:
+                mid = (salary[0] + salary[1]) // 2
+                collect((salary[0], mid), ovr)
+                collect((mid + 1, salary[1]), ovr)
+                return
+            lo, hi = ovr or (_OVR_MIN, _OVR_MAX)
+            if lo < hi:
+                mid = (lo + hi) // 2
+                collect(salary, (lo, mid))
+                collect(salary, (mid + 1, hi))
+                return
+            logger.warning("시드 시즌=%s 급여=%d OVR=%d 한 값에 %d장 — 일부 누락 가능(금요일 풀크롤이 채움)",
+                           season_id, salary[0], lo, len(items))
+        found.update(items)
+        if len(found) > _SEED_MAX_CARDS:
+            raise _TooManyCards()
+
+    try:
+        collect((_SALARY_MIN, _SALARY_MAX), None)
+    except _TooManyCards:
+        pass   # 호출부가 상한 초과로 건너뛴다. 끝까지 긁지 않아 매시 폴링 비용이 작다
+    except requests.RequestException as exc:
+        logger.warning("시드 시즌=%s 실패, 다음 폴링에서 재시도: %s", season_id, exc)
+        return {}
     return found
 
 
-def _seed_spids_from_datacenter(engine, session: requests.Session, run_id: str) -> List[int]:
+def discover_seasons_from_datacenter(session: requests.Session) -> List[dict]:
+    """데이터센터 시즌 필터의 체크박스에서 시즌 목록을 읽는다.
+
+    seasonid.json 도 spid.json 처럼 출시 당일 갱신이 늦을 수 있다(2026-10-29: 26UP·EVO-EP·
+    EVO-CE 가 데이터센터엔 있는데 메타 파일은 10/7 그대로). 그런 시즌은 sync 가 여기서
+    찾아 seasonid 에 넣고, 아래 시드가 spid 를 채운다. class_name 은 임시값이라 넥슨이
+    seasonid.json 을 갱신하면 sync 의 upsert 가 공식 표기로 덮어쓴다.
+    """
+    html = session.get(DATACENTER_URL + "/", timeout=30).text
+    soup = BeautifulSoup(html, "html.parser")
+    seasons: Dict[int, dict] = {}
+    for el in soup.select("input.season_check[data-no]"):
+        try:
+            sid = int(el["data-no"])
+        except (KeyError, ValueError):
+            continue
+        label = soup.find("label", attrs={"for": el.get("id")}) if el.get("id") else None
+        title = (label.get("title") or "").strip() if label else ""
+        img_el = label.find("img") if label else None
+        img = (img_el.get("src") or "").strip() if img_el else ""
+        if not title or not img:
+            continue
+        abbr = img.rsplit("/", 1)[-1].rsplit(".", 1)[0].upper()
+        seasons[sid] = {"seasonId": sid, "className": f"{abbr} ({title})", "seasonImg": img}
+    return list(seasons.values())
+
+
+def _seed_spids_from_datacenter(engine, session: requests.Session, run_id: str,
+                                extra_season_ids: List[int] = ()) -> List[int]:
     """spid 가 0개인 최근 시즌을 데이터센터에서 긁어 crawled=FALSE 로 upsert. 신규 spid 목록 반환.
 
     DB 커넥션은 (1)후보 조회, (2)시즌별 upsert 에서만 짧게 잡는다. 페이지 수백 장을 받는
@@ -546,7 +616,8 @@ def _seed_spids_from_datacenter(engine, session: requests.Session, run_id: str) 
     """
     with engine.begin() as conn:
         candidates = conn.execute(
-            _SEASONS_WITHOUT_SPIDS_SQL, {"recent": _SEED_RECENT_SEASONS}
+            _SEASONS_WITHOUT_SPIDS_SQL,
+            {"recent": _SEED_RECENT_SEASONS, "extra": _pg_array_literal(extra_season_ids)},
         ).all()
 
     all_inserted: List[int] = []
@@ -555,6 +626,12 @@ def _seed_spids_from_datacenter(engine, session: requests.Session, run_id: str) 
         items = fetch_season_spids_from_datacenter(session, season_id)   # 커넥션 없이
         if not items:
             logger.info("시드 시즌=%s(%s): 데이터센터에도 아직 0건", season_id, class_name)
+            continue
+        if len(items) > _SEED_MAX_CARDS:
+            # 2026-10-29 데이터센터에 25 LIVE 가 325 번으로 다시 올라왔다(300 과 같은 선수들,
+            # 수천 장). 출시 당일 신규 시즌은 수백 장이라, 이만큼 크면 사람이 판단할 일이다.
+            logger.warning("시드 시즌=%s(%s): 데이터센터 %d건 — 상한 %d 초과라 건너뜀",
+                           season_id, class_name, len(items), _SEED_MAX_CARDS)
             continue
         spids = sorted(items)
         inserted: List[int] = []
@@ -726,6 +803,38 @@ def read_gone_spids(conn, run_id: str) -> set:
     return set((detail or {}).get("gone") or [])
 
 
+def _insert_datacenter_seasons(engine, session: requests.Session, season_data: list) -> dict:
+    """seasonid.json 에 아직 없는 시즌을 데이터센터에서 찾아 seasonid 에 넣는다(있으면 그대로).
+
+    반환: inserted = 이번에 새로 넣은 시즌, missing_ids = seasonid.json 에 없는 시즌 전부
+    (시드가 상위 N개 밖의 번호 — 예 519 26PL — 도 후보로 보게).
+    """
+    known = {s["seasonId"] for s in season_data}
+    try:
+        found = [s for s in discover_seasons_from_datacenter(session) if s["seasonId"] not in known]
+    except requests.RequestException as exc:
+        logger.warning("데이터센터 시즌 목록 실패, 건너뜀: %s", exc)
+        return {"inserted": [], "missing_ids": []}
+    inserted = []
+    with engine.begin() as conn:
+        for s in found:
+            row = conn.execute(
+                text(f"""
+                    INSERT INTO {PLAYER_SCHEMA}.seasonid (season_id, class_name, season_img)
+                    VALUES (:sid, :cn, :img)
+                    ON CONFLICT (season_id) DO NOTHING
+                    RETURNING season_id
+                """),
+                {"sid": s["seasonId"], "cn": s["className"], "img": s["seasonImg"]},
+            ).first()
+            if row:
+                inserted.append({"season_id": s["seasonId"], "class_name": s["className"]})
+    if found:
+        logger.info("seasonid.json 에 없는 데이터센터 시즌 %s (이번에 추가 %d)",
+                    [s["seasonId"] for s in found], len(inserted))
+    return {"inserted": inserted, "missing_ids": [s["seasonId"] for s in found]}
+
+
 def sync_meta(engine, run_id: str) -> None:
     session = make_session()
     player_data = session.get(PLAYER_URL, timeout=30).json()
@@ -792,7 +901,10 @@ def sync_meta(engine, run_id: str) -> None:
     #    커넥션을 분 단위로 붙들어(idle in transaction) SSL 끊김·풀 고갈을 부른다.
     #    시드된 spid 는 new_spids 에 합산돼 워크플로 게이트가 같은 시각에 crawl 을 연다.
     if _env_int("META_SEED_DISABLE", 0) != 1 and spid_limit == 0:
-        new_spids.extend(_seed_spids_from_datacenter(engine, session, run_id))
+        dc_seasons = _insert_datacenter_seasons(engine, session, season_data)
+        new_seasons.extend(dc_seasons["inserted"])
+        new_spids.extend(_seed_spids_from_datacenter(engine, session, run_id,
+                                                     dc_seasons["missing_ids"]))
 
     logger.info("sync 완료: 신규 spid=%d, 신규 시즌=%d", len(new_spids), len(new_seasons))
     _write_github_output(new_spids=len(new_spids), new_seasons=len(new_seasons))
