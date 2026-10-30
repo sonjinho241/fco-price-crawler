@@ -61,6 +61,8 @@ player.meta_crawl_log 에 적는다.
                             (금요일 풀크롤 전용, 기본 0)
     META_SEED_LARGE_SEASONS 사람이 확인하고 시드를 허락한 큰 시즌 ID(콤마 구분, 예 325). 이 시즌은
                             _SEED_MAX_CARDS 상한 없이 끝까지 긁어 시드한다 (기본 없음)
+    META_SEED_GROWING_SEASONS 새 시즌 번호 없이 카드가 추가되는 기존 시즌(콤마 구분). sync 마다
+                            데이터센터와 대조해 DB 에 없는 spid 만 넣는다 (기본 100,101,110 — ICON 계열)
     META_RECHECK_STALE_HOURS crawl 대상을 이 시간 안에 성공한 적 없는 크롤 완료 spid 로 한정한다
                             — 풀크롤 실패분만 다시 묻는 수동 재확인 (기본 0=끔)
 
@@ -713,6 +715,69 @@ def _seed_spids_from_datacenter(engine, session: requests.Session, run_id: str,
     return all_inserted
 
 
+# ── 기존 시즌에 추가된 카드(ICON 계열) ────────────────────────────────────────
+# 위 시드는 spid 가 0개인 시즌만 본다. 그런데 ICON·ICON The Moment(귀속 포함)는 새 시즌 번호
+# 없이 기존 시즌에 선수를 더한다 — 2026-10-30 ICON TM 신규 8명이 데이터센터에는 100·110·101
+# 에 8장씩 떴는데 spid.json 은 그대로라 앱에 24장이 안 보였다. 그래서 이 시즌들은 매 sync 마다
+# 데이터센터 목록(시즌당 1~2요청)과 대조해 DB 에 없는 spid 만 넣는다.
+_SEED_GROWING_SEASONS = (100, 101, 110)
+
+# 이미 있는 spid 는 건드리지 않는다(이름을 데이터센터 표기로 덮으면 spid.json upsert 와 매번
+# 번갈아 바뀐다).
+_SPID_INSERT_NEW_SQL = text(f"""
+    INSERT INTO {PLAYER_SCHEMA}.spid (spid, name, crawled)
+    SELECT t.spid, t.name, FALSE
+    FROM unnest(CAST(:spids AS bigint[]), CAST(:names AS text[])) AS t(spid, name)
+    ON CONFLICT (spid) DO NOTHING
+    RETURNING spid
+""")
+
+
+def growing_season_ids() -> List[int]:
+    return _env_int_list("META_SEED_GROWING_SEASONS") or list(_SEED_GROWING_SEASONS)
+
+
+def fetch_growing_season_spids(session: requests.Session, season_ids: List[int]) -> Dict[int, str]:
+    """기존 시즌들의 데이터센터 카드 전부. 실패·상한 초과 시즌은 빼고 나머지만 돌려준다."""
+    found: Dict[int, str] = {}
+    for season_id in season_ids:
+        items = fetch_season_spids_from_datacenter(session, season_id)
+        if len(items) > _SEED_MAX_CARDS:
+            logger.warning("추가 카드 대조 시즌=%s: 데이터센터 %d건 — 상한 초과라 건너뜀",
+                           season_id, len(items))
+            continue
+        found.update(items)
+    return found
+
+
+def _seed_growing_spids(engine, run_id: str, items: Dict[int, str]) -> List[int]:
+    """데이터센터에만 있는 spid 를 crawled=FALSE 로 넣는다. 신규 spid 목록 반환.
+    sync 로그는 new_seasons 를 비워 남긴다(notify 가 이걸 신규 시즌으로 세지 않게)."""
+    if not items:
+        return []
+    spids = sorted(items)
+    with engine.begin() as conn:
+        inserted = sorted(
+            r.spid for r in conn.execute(
+                _SPID_INSERT_NEW_SQL,
+                {"spids": _pg_array_literal(spids),
+                 "names": _pg_array_literal(items[sp] for sp in spids)},
+            ).all()
+        )
+        if inserted:
+            conn.execute(
+                text(f"""
+                    INSERT INTO {PLAYER_SCHEMA}.meta_crawl_log
+                        (run_id, phase, new_players, new_seasons, new_spids)
+                    VALUES (:rid, 'sync', :np, '[]', :nsp)
+                """),
+                {"rid": run_id, "np": len(inserted), "nsp": json.dumps(inserted)},
+            )
+    logger.info("기존 시즌 추가 카드: 데이터센터 %d건 → 신규 spid %d건 %s",
+                len(spids), len(inserted), inserted[:20])
+    return inserted
+
+
 def seed_probe() -> None:
     """DB 없이 파서만 점검: META_SEED_SEASON 시즌의 1~2페이지를 받아 spid 수를 찍는다."""
     season_id = _env_int("META_SEED_SEASON", 0)
@@ -803,8 +868,10 @@ def read_last_missing_spids(conn) -> set:
     return missing
 
 
-def _log_gone_spids(engine, run_id: str, player_data: list) -> None:
-    listed = {int(p["id"]) for p in player_data}
+def _log_gone_spids(engine, run_id: str, player_data: list, also_listed=()) -> None:
+    # also_listed = 데이터센터에서 확인한 기존 시즌 추가 카드. spid.json 이 늦어도 시즌은
+    # spid.json 에 있으므로, 이걸 넣지 않으면 크롤된 다음 금요일에 사라진 카드로 숨겨진다.
+    listed = {int(p["id"]) for p in player_data} | set(also_listed)
     listed_seasons = {spid // 1_000_000 for spid in listed}
     fresh_since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=_GONE_FRESH_DAYS)
 
@@ -961,21 +1028,26 @@ def sync_meta(engine, run_id: str) -> None:
             },
         )
 
+    seed_enabled = _env_int("META_SEED_DISABLE", 0) != 1 and spid_limit == 0
+    # 기존 시즌 추가 카드는 HTTP 만 먼저(커넥션 없이) — 사라진 카드 판정에도 쓴다.
+    growing = fetch_growing_season_spids(session, growing_season_ids()) if seed_enabled else {}
+
     # 넥슨이 지운 카드 감지(금요일 풀크롤 전용). 시드보다 먼저 — 시드분은 아직 spid.json 에
     # 없어서 섞이면 사라진 카드로 오판한다.
     if _env_int("META_DETECT_GONE", 0) == 1 and spid_limit == 0:
-        _log_gone_spids(engine, run_id, player_data)
+        _log_gone_spids(engine, run_id, player_data, growing)
 
     # 출시 당일 폴백: 시즌은 들어왔는데 spid 가 하나도 없는 최근 시즌 → 데이터센터 시드.
     # (spid.json 이 seasonid.json 보다 늦어 목요일 crawl 이 빈손이 되는 것을 막는다.)
     # ⚠️ 반드시 위 트랜잭션 **밖**에서. 시드는 수백 페이지 HTTP 라 트랜잭션 안에서 돌면
     #    커넥션을 분 단위로 붙들어(idle in transaction) SSL 끊김·풀 고갈을 부른다.
     #    시드된 spid 는 new_spids 에 합산돼 워크플로 게이트가 같은 시각에 crawl 을 연다.
-    if _env_int("META_SEED_DISABLE", 0) != 1 and spid_limit == 0:
+    if seed_enabled:
         dc_seasons = _insert_datacenter_seasons(engine, session, season_data)
         new_seasons.extend(dc_seasons["inserted"])
         new_spids.extend(_seed_spids_from_datacenter(engine, session, run_id,
                                                      dc_seasons["missing_ids"]))
+        new_spids.extend(_seed_growing_spids(engine, run_id, growing))
 
     logger.info("sync 완료: 신규 spid=%d, 신규 시즌=%d", len(new_spids), len(new_seasons))
     _write_github_output(new_spids=len(new_spids), new_seasons=len(new_seasons))

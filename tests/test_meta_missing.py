@@ -112,6 +112,41 @@ class SeedSplitTest(unittest.TestCase):
             self.assertLessEqual(len(self._run(100)), m._DATACENTER_LIST_CAP)
 
 
+class GrowingSeasonTest(unittest.TestCase):
+    """ICON 계열은 기존 시즌에 카드가 추가된다(2026-10-30 ICON TM 8명 → 100·101·110 에 8장씩)."""
+
+    def test_default_seasons(self):
+        with mock.patch.dict(m.os.environ, {}, clear=True):
+            self.assertEqual(m.growing_season_ids(), [100, 101, 110])
+
+    def test_env_override(self):
+        with mock.patch.dict(m.os.environ, {"META_SEED_GROWING_SEASONS": "100"}):
+            self.assertEqual(m.growing_season_ids(), [100])
+
+    def test_fetch_skips_oversized_season(self):
+        lists = {100: {100082092: "마리오 켐페스"}, 101: {101000000 + i: "" for i in range(1001)}}
+        with mock.patch.object(m, "fetch_season_spids_from_datacenter",
+                               lambda session, sid: lists.get(sid, {})):
+            self.assertEqual(m.fetch_growing_season_spids(None, [100, 101, 110]),
+                             {100082092: "마리오 켐페스"})
+
+    def test_growing_cards_are_not_gone(self):
+        """spid.json 이 늦어도 데이터센터에 있는 추가 카드는 사라진 카드로 숨기지 않는다."""
+        conn = mock.MagicMock()
+        conn.execute.side_effect = lambda sql, *a: {
+            id(m._ALL_CRAWLED_SPIDS_SQL): [mock.Mock(spid=100082092, crawled_at=None),
+                                           mock.Mock(spid=100000001, crawled_at=None)],
+            id(m._HIDDEN_SPIDS_SQL): [],
+            id(m._LAST_MISSING_SQL): [],
+        }.get(id(sql), mock.Mock(rowcount=0))
+        engine = mock.Mock()
+        engine.connect.return_value.__enter__ = lambda s: conn
+        engine.connect.return_value.__exit__ = lambda *a: False
+        m._log_gone_spids(engine, "r", [{"id": 100000001}], {100082092: "마리오 켐페스"})
+        hides = [c for c in conn.execute.call_args_list if c.args[0] is m._HIDE_SPIDS_SQL]
+        self.assertEqual(hides, [])
+
+
 class EnvListTest(unittest.TestCase):
     def test_parse(self):
         with mock.patch.dict(m.os.environ, {"META_SEED_LARGE_SEASONS": "325, 326,x"}):
