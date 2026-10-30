@@ -59,15 +59,24 @@ class CardMissingTest(unittest.TestCase):
 class SplitMissingTest(unittest.TestCase):
     def test_card_move_is_hidden(self):
         # 실제 이동: 샤드당 약 6%
-        hide, outage = m.split_missing([3, 1, 2], 50)
+        hide, outage = m.split_missing([3, 1, 2], 50, 47)
         self.assertEqual((hide, outage), ([1, 2, 3], 0))
 
     def test_mass_error_page_is_outage(self):
-        hide, outage = m.split_missing(list(range(20)), 100)
+        hide, outage = m.split_missing(list(range(20)), 100, 80)
         self.assertEqual((hide, outage), ([], 20))
 
+    def test_recheck_mostly_missing_is_hidden(self):
+        # 실패분 재확인: 대상 1404장 중 1362장이 오류 페이지여도 샤드 몫(약 2.2만) 대비 6%
+        hide, outage = m.split_missing(list(range(1362)), 22345, 42)
+        self.assertEqual((len(hide), outage), (1362, 0))
+
+    def test_no_success_is_outage(self):
+        hide, outage = m.split_missing(list(range(10)), 22345, 0)
+        self.assertEqual((hide, outage), ([], 10))
+
     def test_nothing_missing(self):
-        self.assertEqual(m.split_missing([], 0), ([], 0))
+        self.assertEqual(m.split_missing([], 0, 0), ([], 0))
 
 
 class LastMissingTest(unittest.TestCase):

@@ -1093,10 +1093,13 @@ def read_target_spids(conn, only_new: bool, stale_hours: int = 0) -> List[int]:
     return [r[0] for r in conn.execute(text(sql), {"h": stale_hours}).all()]
 
 
-def split_missing(missing: List[int], total: int) -> Tuple[List[int], int]:
-    """(숨길 spid, 실패로 셀 수). 오류 페이지가 샤드의 상한 비율을 넘으면 점검으로 보고
-    하나도 숨기지 않고 전부 실패로 센다."""
-    if total and len(missing) / total > _MISSING_HIDE_MAX_RATIO:
+def split_missing(missing: List[int], population: int, successes: int) -> Tuple[List[int], int]:
+    """(숨길 spid, 실패로 셀 수). 넥슨 점검으로 보면 하나도 숨기지 않고 전부 실패로 센다:
+      · 같은 샤드에서 한 장도 열리지 않았거나,
+      · 오류 페이지가 샤드 몫의 전체 카드(population) 대비 상한 비율을 넘을 때.
+    population 은 풀크롤이면 샤드 대상 수, 실패분 재확인이면 전체 카드 ÷ 샤드 수다 —
+    재확인 대상은 원래 실패한 카드라 대부분 오류 페이지인 게 정상이다(2026-10-30 1362/1404)."""
+    if missing and (successes == 0 or len(missing) / max(population, 1) > _MISSING_HIDE_MAX_RATIO):
         return [], len(missing)
     return sorted(missing), 0
 
@@ -1280,6 +1283,10 @@ def crawl_shard(engine, run_id: str) -> None:
         if spid_limit > 0:
             all_spids = all_spids[:spid_limit]
         spids, index, count = _shard(all_spids)
+        population = len(spids)
+        if stale_hours > 0:
+            total = engine_conn.execute(text(f"SELECT count(*) FROM {PLAYER_SCHEMA}.spid")).scalar()
+            population = max(population, (total or 0) // count)
         existing_map = _load_existing(engine_conn, spids)
         shard_set = set(spids)
         hidden_before = {
@@ -1314,6 +1321,7 @@ def crawl_shard(engine, run_id: str) -> None:
         mark_buf: List[int] = []
         missing: List[int] = []
         revived: List[int] = []
+        succeeded = 0
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [
@@ -1372,6 +1380,7 @@ def crawl_shard(engine, run_id: str) -> None:
                             seen_new_team_colors[cid] = tc["name"]
                             known_team_color_ids.add(cid)
 
+                    succeeded += 1
                     if spid in hidden_before:
                         revived.append(spid)   # 오류 페이지였다가 다시 열린 카드
                     mark_buf.append(spid)
@@ -1392,10 +1401,10 @@ def crawl_shard(engine, run_id: str) -> None:
         resolver.close()
         newly_missing = 0
         if track_missing:
-            to_hide, outage = split_missing(missing, len(spids))
+            to_hide, outage = split_missing(missing, population, succeeded)
             if outage:
-                logger.warning("오류 페이지 %d/%d 장 — 상한 %.0f%% 초과라 점검으로 보고 숨기지 않습니다",
-                               outage, len(spids), _MISSING_HIDE_MAX_RATIO * 100)
+                logger.warning("오류 페이지 %d장(샤드 몫 %d장, 성공 %d장) — 점검으로 보고 숨기지 않습니다",
+                               outage, population, succeeded)
                 failures += outage
             newly_missing = _record_missing(engine_conn, run_id, index, to_hide,
                                             hidden_before, revived)
