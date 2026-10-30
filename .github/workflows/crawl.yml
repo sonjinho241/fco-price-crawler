@@ -3,20 +3,25 @@ name: crawl-prices
 # 넥슨 시세(PlayerPriceGraph) → player_price_latest·player_price_strongs.
 # 공개 저장소이므로 GitHub Actions 분(分)은 무제한 → 비용 0원.
 #
-# ⚙️ 2026-10-30 부터 매시 한 번, 낮은 속도(전체 4 req/s 이하, 상한 5)로 조금씩 돈다.
+# ⚙️ 2026-10-30 부터 낮은 속도(전체 4 req/s 이하, 상한 5)로 시각 버킷을 하나씩 돈다.
 #    예전엔 전 카드를 하루 6토막에 나눠 토막마다 35 req/s 로 92분 몰아서 보냈다(하루 116만 건).
 #    2026-10-29 넥슨(Cloudflare)이 GitHub 러너의 iteminfo 수집을 429 로 막아 요청량과 시간 분포를 바꿨다.
 #    hot(조회·스쿼드·팩 후보 카드)은 24시간, 나머지 tail 은 168시간에 한 바퀴(하루 약 22만 건).
-#    어느 버킷을 돌지는 crawler_job.py 가 player.price_crawl_state 를 보고 정한다(밀리면 실행당 최대 3버킷).
+#    어느 버킷을 돌지는 crawler_job.py 가 player.price_crawl_state 를 보고 정한다.
 #    설계: 메인 저장소 docs/price-crawl-two-tier-plan.md
+#
+# ⚙️ 매시 cron 은 하루 3번 남짓밖에 안 왔다(10-29 17:28 ~ 10-30 12:20 UTC 에 3번, 같은 레포 meta-thursday
+#    매시 cron 도 14번 중 3번). 그래서 실행 하나가 330분 머물며 밀린 버킷을 차례로 받고 다 따라잡으면
+#    다음 정시까지 자다가, 끝날 때 아래 "Chain next run" 이 다음 실행을 띄운다(GITHUB_TOKEN 의
+#    workflow_dispatch 는 새 실행을 만든다). cron 은 사슬이 끊겼을 때 다시 잇는 예비다.
 on:
   schedule:
-    # 정각은 GitHub 혼잡 시간이라 피한다. cron 이 늦거나 빠져도 다음 실행이 밀린 버킷을 메운다.
+    # 정각은 GitHub 혼잡 시간이라 피한다. 사슬이 돌고 있으면 concurrency 로 대기했다가 할 일 없이 끝난다.
     - cron: "7 * * * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: "bucket=매시 실행과 같음 / only_new=시세 표에 없는 카드 전부 / full=전 카드(5 req/s 상한이라 한 번에 안 끝난다)"
+        description: "bucket=자동 실행과 같음(끝나면 다음 실행을 잇는다) / only_new=시세 표에 없는 카드 전부 / full=전 카드(5 req/s 상한이라 한 번에 안 끝난다)"
         required: false
         default: "bucket"
         type: choice
@@ -39,10 +44,12 @@ on:
         default: "4"
 
 # 최소권한. ⚠️ pull_request 트리거는 절대 추가하지 말 것(외부 fork 의 시크릿 노출 방지).
+# actions: write 는 끝날 때 다음 실행을 띄우는 데만 쓴다.
 permissions:
   contents: read
+  actions: write
 
-# 실행이 겹치지 않게(이전 실행이 길어지면 다음 cron 은 대기, 대기 중인 것은 최신 하나만 남는다).
+# 실행이 겹치지 않게(이어 띄운 실행·cron 은 앞 실행이 끝날 때까지 대기, 대기 중인 것은 최신 하나만 남는다).
 concurrency:
   group: crawl-prices
   cancel-in-progress: false
@@ -50,9 +57,12 @@ concurrency:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    # 매시 실행은 50분 예산 안에서만 다음 버킷을 시작한다. 수동 only_new·full 은 길게 둔다.
-    timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.mode == 'bucket') && 75 || 350 }}
+    # 크롤러는 330분 예산 안에 끝날 버킷만 시작한다. 잡 상한(360분) 아래로 여유를 둔다.
+    timeout-minutes: 350
     steps:
+      - name: Mark start
+        run: echo "CRAWL_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v5
 
@@ -76,3 +86,21 @@ jobs:
           PRICE_LATEST_ONLY_NEW: ${{ inputs.mode == 'only_new' && '1' || '0' }}
           PRICE_LATEST_FULL: ${{ inputs.mode == 'full' && '1' || '0' }}
         run: python crawler_job.py
+
+      # 다음 실행을 잇는다. 실패(넥슨 차단 포함)·취소된 실행은 잇지 않는다 — 막힌 채 바로 다시 두드리지
+      # 않게, 그때는 예비 cron 이 다시 잇는다. 수동 스모크(limit)·only_new·full·main 아닌 브랜치도 잇지 않는다.
+      # 10분도 안 돌고 끝난 실행은 잇지 않는다(무언가 잘못돼 바로 끝나는 실행이 끝없이 이어지지 않게).
+      - name: Chain next run
+        if: >-
+          success() && github.ref == 'refs/heads/main' &&
+          (github.event_name == 'schedule' || (inputs.mode == 'bucket' && inputs.limit == '0'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ran=$(( $(date +%s) - CRAWL_STARTED ))
+          if [ "$ran" -lt 600 ]; then
+            echo "실행이 ${ran}초 만에 끝나 다음 실행을 잇지 않습니다(예비 cron 이 잇는다)."
+            exit 0
+          fi
+          gh workflow run crawl.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo "다음 실행을 띄웠습니다(${ran}초 실행)."

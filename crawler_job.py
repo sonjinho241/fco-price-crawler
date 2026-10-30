@@ -1,7 +1,8 @@
 """
 FC Online 선수 "최신 시세만" 크롤러 — 공개 저장소용 자기완결형 스크립트.
 
-GitHub Actions(공개 저장소 = Actions 분 무제한)에서 매시 한 번 돈다. 넥슨에서 선수×강화단계당
+GitHub Actions(공개 저장소 = Actions 분 무제한)에서 한 실행이 5시간 30분 머물며 시각 버킷을 차례로
+받고, 끝날 때 다음 실행을 스스로 띄운다(crawl.yml). 넥슨에서 선수×강화단계당
 '가장 최근 1줄'만 받아 player.player_price_latest 와 player.player_price_strongs 에 upsert 한다.
 멱등(idempotent)하므로 중간에 죽어도 다시 돌리면 이어서 채워진다.
 
@@ -15,8 +16,13 @@ GitHub Actions(공개 저장소 = Actions 분 무제한)에서 매시 한 번 �
 
    카드마다 크롤 시각을 두지 않는다(그러면 player_price_strongs 의 "값이 같으면 UPDATE 스킵"이
    무력화돼 전 행이 매주 다시 쓰인다). 대신 spid 의 고정 해시로 시각 버킷을 정한다(bucket_of).
-   마지막으로 끝낸 버킷만 player.price_crawl_state 한 행에 적고, cron 이 늦거나 빠지면 밀린
-   버킷을 실행당 최대 3개까지 메운다.
+   마지막으로 끝낸 버킷만 player.price_crawl_state 한 행에 적는다.
+
+⚠️ 2026-10-30 매시 cron 하나에 기대던 방식은 cron 이 하루 3번 남짓밖에 안 와서(19시간에 3번) 버킷이
+   밀렸다. 그래서 실행 하나가 길게 머문다(run_buckets): 밀린 버킷을 가장 오래된 것부터 **하나씩**
+   받고(동시에 여러 버킷을 몰아 받지 않는다, 속도도 그대로), 다 따라잡으면 다음 정시까지 잔다.
+   예산(기본 330분) 안에 다음 버킷을 못 끝내면 멈추고, 워크플로가 다음 실행을 바로 이어 띄운다.
+   cron 은 사슬이 끊겼을 때(넥슨 차단으로 실패한 실행은 잇지 않는다) 다시 잇는 예비다.
 
 ⚠️ 2026-10-27 부터 두 표에 함께 쓴다(전환 기간). player_price_strongs 는 카드당 한 행에
    강화 1~13단계를 배열로 담는 새 표(115만 행·159MB → 8.8만 행·22MB)이고, 앱 서버가 그 표로
@@ -46,8 +52,8 @@ GitHub Actions(공개 저장소 = Actions 분 무제한)에서 매시 한 번 �
     PRICE_LATEST_WORKERS        동시 요청 스레드 수 (기본 3)
     PRICE_LATEST_REQUEST_DELAY  워커가 요청마다 쉬는 최소 초. 실제로는 [값, 2×값] 사이 무작위 (기본 0.4)
     PRICE_LATEST_MAX_RATE       모든 워커를 합친 초당 요청 상한 (기본 4, 5 를 넘기면 5 로 자른다)
-    PRICE_LATEST_BUDGET_MIN     다음 버킷을 시작해도 되는 실행 시간 예산(분) (기본 50)
-    PRICE_LATEST_NEW_CAP        실행마다 먼저 받는 신규 카드(시세 표에 없는 spid) 상한 (기본 100)
+    PRICE_LATEST_BUDGET_MIN     한 실행의 시간 예산(분). 이 안에 끝날 버킷만 시작한다 (기본 330)
+    PRICE_LATEST_NEW_CAP        버킷마다 먼저 받는 신규 카드(시세 표에 없는 spid) 상한 (기본 100)
     PRICE_LATEST_CHUNK_SIZE     한 번에 제출/처리하는 (spid,strong) 작업 수 (기본 1300 = 100카드)
     PRICE_LATEST_DB_BATCH       DB 에 한 번에 upsert 하는 행 수 (기본 500)
     PRICE_LATEST_MAX_RETRIES    넥슨 호출 재시도 횟수(429·403 제외) (기본 3)
@@ -265,7 +271,7 @@ def read_hot_spids(conn) -> Set[int]:
 
 
 # 마지막으로 끝낸 시각 버킷(정시). 표 정의는 메인 저장소 scripts/price_crawl_state.sql.
-# 실행당 한 행만 바꾸므로 IO 는 무시해도 된다.
+# 버킷마다 한 행만 바꾸므로 IO 는 무시해도 된다.
 _STATE_ID = 1
 
 
@@ -476,8 +482,9 @@ def _parse_strongs(spec: str) -> List[int]:
 # ---- 시각 버킷 ----------------------------------------------------------------
 HOT_BUCKETS = 24             # 하루 시각(KST 0~23시)
 TAIL_BUCKETS = 168           # 주간 시각(KST 월 00시 = 0 … 일 23시 = 167)
-MAX_CATCHUP = 3              # 실행당 처리하는 버킷 상한. 밀린 버킷을 몰아치지 않는다.
 MAX_LAG = timedelta(days=7)  # 이보다 밀리면 지금 버킷부터 새로 시작한다
+# 버킷 하나의 평균 요청 수(89,383장×13÷168 + 4,479장×13÷24 ≈ 9,000, 2026-10-30 실측). 준비 전 예산 판단용.
+BUCKET_TASKS_GUESS = 9000
 VACUUM_EVERY_HOURS = 6       # KST 04·10·16·22시 버킷이 끝나면 VACUUM (이전 6토막과 같은 하루 4~6회 수준)
 
 
@@ -503,7 +510,7 @@ def tail_slot(bucket_at: datetime) -> int:
 
 
 def pending_buckets(last: Optional[datetime], now: datetime,
-                    limit: int = MAX_CATCHUP, max_lag: timedelta = MAX_LAG) -> List[datetime]:
+                    limit: int = 1, max_lag: timedelta = MAX_LAG) -> List[datetime]:
     """이번 실행이 처리할 시각 버킷(정시, 오래된 순).
 
     마지막으로 끝낸 버킷 다음 정시부터 지금 정시까지가 밀린 몫이고, 앞에서 [limit] 개만 한다.
@@ -688,14 +695,14 @@ class CrawlStats:
         self.done = 0
         self.written = 0
         self.changed = 0
+        self.busy = 0.0  # crawl() 안에서 보낸 시간(쉬는 시간 제외)
         self.started = time.monotonic()
 
     def elapsed(self) -> float:
         return time.monotonic() - self.started
 
-    def rate(self) -> float:
-        elapsed = self.elapsed()
-        return self.done / elapsed if elapsed else 0.0
+    def busy_rate(self) -> float:
+        return self.done / self.busy if self.busy else 0.0
 
 
 class Crawler:
@@ -742,23 +749,101 @@ class Crawler:
                 )
                 if self.gate.blocked:
                     logger.warning("%s: 넥슨이 계속 막아 멈춥니다(남은 작업 %d)", label, total - done)
+                    self.stats.busy += time.monotonic() - started
                     return False
+        self.stats.busy += time.monotonic() - started
         return True
 
 
-def plan_buckets(conn, now: datetime) -> Tuple[List[datetime], List[int], Set[int]]:
-    """버킷 방식 실행 준비 → (처리할 버킷, 전 카드 spid, hot spid)."""
-    last = read_last_bucket(conn)
-    buckets = pending_buckets(last, now)
+def load_bucket(conn, bucket_at: datetime, new_cap: int) -> Tuple[List[int], List[int], List[int]]:
+    """버킷 하나를 돌 준비 → (먼저 받을 신규 카드, hot 몫, tail 몫). hot 집합은 버킷마다 다시 센다."""
+    new = read_new_spids(conn)[:max(0, new_cap)]
     all_spids = read_spids(conn)
     hot = read_hot_spids(conn) & set(all_spids)
+    hot_part, tail_part = bucket_spids(bucket_at, all_spids, hot, skip=set(new))
     logger.info(
-        "상태: 마지막 버킷=%s → 이번 버킷 %s | 전 카드 %d, hot %d (%.1f%%)",
-        last.astimezone(_KST).isoformat() if last else "없음",
-        [f"{b.astimezone(_KST):%m-%d %H}시" for b in buckets], len(all_spids),
-        len(hot), 100 * len(hot) / max(1, len(all_spids)),
+        "버킷 %s 준비: 전 카드 %d, hot %d (%.1f%%) → 신규 %d + hot %d + tail %d",
+        f"{bucket_at.astimezone(_KST):%m-%d %H}시", len(all_spids), len(hot),
+        100 * len(hot) / max(1, len(all_spids)), len(new), len(hot_part), len(tail_part),
     )
-    return buckets, all_spids, hot
+    return new, hot_part, tail_part
+
+
+# 따라잡은 뒤 다음 버킷을 기다릴 때 정시보다 조금 늦게 깬다(시계 오차·정시 혼잡 회피).
+WAKE_DELAY = timedelta(seconds=90)
+# 아직 속도를 못 쟀을 때 버킷 소요 시간 추정에 쓰는 속도(스모크·첫 실행 실측 3.1~3.3 req/s).
+ASSUMED_RATE = 3.0
+
+
+def next_action(last: Optional[datetime], now: datetime, elapsed: float, budget: float,
+                bucket_estimate: float) -> Tuple[str, Optional[datetime], float]:
+    """긴 실행이 다음에 할 일 → ("crawl", 버킷, 0) / ("sleep", None, 초) / ("stop", None, 0).
+
+    밀린 버킷이 있으면 가장 오래된 하나를 받는다(한 번에 하나씩, 몰아 받지 않는다). 없으면 다음 정시까지
+    잔다. 받는 데([bucket_estimate] 초)나 기다렸다 받는 데 실행 예산([budget] 초)을 넘기면 멈춘다 —
+    워크플로가 다음 실행을 바로 이어 띄운다.
+    """
+    pending = pending_buckets(last, now, limit=1)
+    if pending:
+        if elapsed + bucket_estimate > budget:
+            return "stop", None, 0.0
+        return "crawl", pending[0], 0.0
+    wait = (floor_hour(now) + timedelta(hours=1) + WAKE_DELAY - now).total_seconds()
+    if elapsed + wait + bucket_estimate > budget:
+        return "stop", None, 0.0
+    return "sleep", None, wait
+
+
+def run_buckets(engine, crawler: Crawler, budget: float, new_cap: int, sleep=time.sleep) -> bool:
+    """매시 방식의 긴 실행. 상태 표를 버킷마다 다시 읽고, 끝낸 버킷만 적는다. 막히면 False."""
+    started = time.monotonic()
+    strongs = len(crawler.strongs)
+    while True:
+        with engine.connect() as conn:
+            last = read_last_bucket(conn)
+        elapsed = time.monotonic() - started
+        rate = crawler.stats.busy_rate() or ASSUMED_RATE
+        # 버킷 크기는 준비해 봐야 알므로, 먼저 평균 크기(전 카드×13÷168 + hot×13÷24 ≈ 9,000건)로 가늠한다.
+        action, bucket_at, wait = next_action(
+            last, datetime.now(timezone.utc), elapsed, budget, BUCKET_TASKS_GUESS / rate)
+        if action == "stop":
+            logger.info("실행 예산(%.0f분) 안에 다음 버킷을 끝낼 수 없어 멈춥니다(경과 %.0f분, 마지막 버킷 %s)",
+                        budget / 60, elapsed / 60,
+                        last.astimezone(_KST).isoformat() if last else "없음")
+            return True
+        if action == "sleep":
+            logger.info("밀린 버킷이 없습니다. %.0f초 쉬고 다음 정시 버킷을 받습니다.", wait)
+            sleep(wait)
+            continue
+
+        with engine.connect() as conn:
+            new, hot_part, tail_part = load_bucket(conn, bucket_at, new_cap)
+        estimate = (len(new) + len(hot_part) + len(tail_part)) * strongs / rate
+        if elapsed + estimate > budget:
+            logger.info("버킷 %s 은 예산 안에 못 끝나(예상 %.0f분) 다음 실행에 넘깁니다.",
+                        bucket_at.astimezone(_KST).isoformat(), estimate / 60)
+            return True
+        if new and not crawler.crawl("신규 카드", new):
+            return False
+        label = f"버킷 {bucket_at.astimezone(_KST):%m-%d %H}시 (hot {len(hot_part)} + tail {len(tail_part)})"
+        changed_before = crawler.stats.changed
+        if not crawler.crawl(label, hot_part + tail_part):
+            return False
+        write_last_bucket(engine, bucket_at)
+        logger.info("상태 표: 마지막 버킷 = %s (누적 %.2f req/s, 429·403=%d)",
+                    bucket_at.astimezone(_KST).isoformat(), crawler.stats.busy_rate(), crawler.gate.throttled)
+        # 6시간에 한 번(KST 04·10·16·22시 버킷)만 청소한다. 받은 행의 66% 가 값이 바뀌어(현재가는 2시간마다
+        # 움직인다) 행 수 임계로는 매시 돌게 된다 — 매시 VACUUM 은 그 자체가 IO 다.
+        if hot_slot(bucket_at) % VACUUM_EVERY_HOURS == 4 and crawler.stats.changed > changed_before:
+            _vacuum(engine)
+
+
+def _vacuum(engine) -> None:
+    try:
+        vacuum_analyze(engine)
+        logger.info("VACUUM (ANALYZE) 완료: %s.player_price_latest·player_price_strongs", PLAYER_SCHEMA)
+    except Exception as exc:  # 청소 실패가 배치 성공을 뒤집지 않게.
+        logger.warning("VACUUM 스킵(실패): %s", exc)
 
 
 def run() -> None:
@@ -774,7 +859,7 @@ def run() -> None:
     max_retries = _env_int("PRICE_LATEST_MAX_RETRIES", 3)
     delay = _env_float("PRICE_LATEST_REQUEST_DELAY", 0.4)
     max_rate = _env_float("PRICE_LATEST_MAX_RATE", 4.0)
-    budget = _env_float("PRICE_LATEST_BUDGET_MIN", 50) * 60
+    budget = _env_float("PRICE_LATEST_BUDGET_MIN", 330) * 60
     new_cap = _env_int("PRICE_LATEST_NEW_CAP", 100)
     spid_limit = _env_int("PRICE_LATEST_LIMIT", 0)
     only_new = os.getenv("PRICE_LATEST_ONLY_NEW", "0") == "1"
@@ -792,76 +877,39 @@ def run() -> None:
     gate = RateGate(max_rate)
     crawler = Crawler(engine, session, gate, strongs, workers, delay, max_retries, chunk_size, db_batch)
     logger.info(
-        "설정: workers=%d delay=%.2f~%.2fs 전체 상한=%.1f req/s strongs=%s",
-        workers, delay, 2 * delay, 1 / gate.min_interval, strongs,
+        "설정: workers=%d delay=%.2f~%.2fs 전체 상한=%.1f req/s 예산=%.0f분 strongs=%s",
+        workers, delay, 2 * delay, 1 / gate.min_interval, budget / 60, strongs,
     )
 
-    # (이름, spid 목록, 끝나면 상태 표에 적을 버킷 또는 None)
-    segments: List[Tuple[str, List[int], Optional[datetime]]] = []
-    vacuum_hour = False
+    # 수동 실행(신규만·전 카드·스모크 limit)은 한 번 돌고 끝낸다. 상태 표는 건드리지 않는다.
+    one_shot: Optional[Tuple[str, List[int]]] = None
     # spid 목록만 읽고 커넥션을 바로 돌려준다. 이후 쓰기는 flush 마다 새로 체크아웃한다
     # (bulk_upsert_latest 주석 참고).
     with engine.connect() as conn:
         if only_new:
-            segments.append(("신규 카드", read_new_spids(conn), None))
+            one_shot = ("신규 카드", read_new_spids(conn))
         elif full:
-            segments.append(("전 카드", read_spids(conn), None))
-        else:
-            # 신규 카드는 버킷을 기다리지 않고 먼저 받는다. 새 시즌이 한꺼번에 들어오면 상한만큼씩 나눠 받는다.
-            new = read_new_spids(conn)[:max(0, new_cap)]
-            if new:
-                segments.append(("신규 카드", new, None))
-            buckets, all_spids, hot = plan_buckets(conn, datetime.now(timezone.utc))
-            for bucket_at in buckets:
-                hot_part, tail_part = bucket_spids(bucket_at, all_spids, hot, skip=set(new))
-                label = (f"버킷 {bucket_at.astimezone(_KST):%m-%d %H}시 "
-                         f"(hot {len(hot_part)} + tail {len(tail_part)})")
-                segments.append((label, hot_part + tail_part, bucket_at))
-                vacuum_hour = vacuum_hour or hot_slot(bucket_at) % VACUUM_EVERY_HOURS == 4
-
-    if spid_limit > 0:  # 스모크 테스트: 앞에서 [limit] 장만 받고 상태 표는 건드리지 않는다
-        remaining = spid_limit
-        limited: List[Tuple[str, List[int], Optional[datetime]]] = []
-        for label, spids, _ in segments:
-            if remaining <= 0:
-                break
-            limited.append((f"{label} [limit]", spids[:remaining], None))
-            remaining -= len(limited[-1][1])
-        segments = limited
-
-    blocked = False
-    for i, (label, spids, bucket_at) in enumerate(segments):
-        # 둘째 버킷부터는 예산 안에 끝날 것 같을 때만 시작한다(다음 정시 실행이 너무 밀리지 않게).
-        if i > 0 and bucket_at is not None and crawler.stats.done:
-            estimate = len(spids) * len(strongs) / max(0.1, crawler.stats.rate())
-            if crawler.stats.elapsed() + estimate > budget:
-                logger.info("예산(%.0f분) 안에 못 끝나 남은 버킷은 다음 실행에 넘깁니다: %s",
-                            budget / 60, label)
-                break
-        if not crawler.crawl(label, spids):
-            blocked = True
-            break
-        if bucket_at is not None:
-            write_last_bucket(engine, bucket_at)
-            logger.info("상태 표: 마지막 버킷 = %s", bucket_at.astimezone(_KST).isoformat())
+            one_shot = ("전 카드", read_spids(conn))
+        elif spid_limit > 0:
+            bucket_at = floor_hour(datetime.now(timezone.utc))
+            new, hot_part, tail_part = load_bucket(conn, bucket_at, new_cap)
+            one_shot = (f"버킷 {bucket_at.astimezone(_KST):%m-%d %H}시 [limit]", new + hot_part + tail_part)
+    if one_shot is not None:
+        label, spids = one_shot
+        if spid_limit > 0:
+            spids = spids[:spid_limit]
+        ok = crawler.crawl(label, spids)
+        if ok and crawler.stats.changed and (full or only_new):
+            _vacuum(engine)
+    else:
+        ok = run_buckets(engine, crawler, budget, new_cap)
 
     stats = crawler.stats
     logger.info(
         "배치 완료: tasks=%d written=%d changed=%d elapsed=%.0fs %.2f req/s 429·403=%d",
-        stats.done, stats.written, stats.changed, stats.elapsed(), stats.rate(), gate.throttled,
+        stats.done, stats.written, stats.changed, stats.elapsed(), stats.busy_rate(), gate.throttled,
     )
-
-    # 6시간에 한 번(KST 04·10·16·22시 버킷)만 청소한다. 스모크에서 받은 행의 66% 가 값이 바뀌어
-    # (현재가는 2시간마다 움직인다) 행 수 임계로는 매시 돌게 된다 — 매시 VACUUM 은 그 자체가 IO 다.
-    # 수동 전 카드·신규 실행은 끝에 한 번 청소한다.
-    if stats.changed and (vacuum_hour or full or only_new):
-        try:
-            vacuum_analyze(engine)
-            logger.info("VACUUM (ANALYZE) 완료: %s.player_price_latest·player_price_strongs", PLAYER_SCHEMA)
-        except Exception as exc:  # 청소 실패가 배치 성공을 뒤집지 않게.
-            logger.warning("VACUUM 스킵(실패): %s", exc)
-
-    if blocked:
+    if not ok:
         raise SystemExit("넥슨이 429·403 으로 계속 막았습니다 — 끝내지 못한 버킷은 다음 실행이 다시 받습니다.")
 
 

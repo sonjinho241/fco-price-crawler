@@ -82,10 +82,11 @@ class PendingBucketsTest(unittest.TestCase):
     def test_already_done(self):
         self.assertEqual(cj.pending_buckets(self.current, self.now), [])
 
-    def test_catch_up_capped_at_three_oldest_first(self):
+    def test_catch_up_one_at_a_time_oldest_first(self):
         last = self.current - timedelta(hours=6)
+        self.assertEqual(cj.pending_buckets(last, self.now), [self.current - timedelta(hours=5)])
         self.assertEqual(
-            cj.pending_buckets(last, self.now),
+            cj.pending_buckets(last, self.now, limit=3),
             [self.current - timedelta(hours=5), self.current - timedelta(hours=4),
              self.current - timedelta(hours=3)],
         )
@@ -101,6 +102,136 @@ class PendingBucketsTest(unittest.TestCase):
     def test_state_stored_in_utc(self):
         last = (self.current - timedelta(hours=1)).astimezone(timezone.utc)
         self.assertEqual(cj.pending_buckets(last, self.now), [self.current])
+
+
+class NextActionTest(unittest.TestCase):
+    now = datetime(2026, 10, 30, 14, 7, tzinfo=KST)
+    current = datetime(2026, 10, 30, 14, 0, tzinfo=KST)
+    budget = 330 * 60
+    bucket = 45 * 60
+
+    def test_behind_crawls_oldest(self):
+        last = self.current - timedelta(hours=12)
+        self.assertEqual(cj.next_action(last, self.now, 0, self.budget, self.bucket),
+                         ("crawl", last + timedelta(hours=1), 0.0))
+
+    def test_behind_but_out_of_budget_stops(self):
+        last = self.current - timedelta(hours=12)
+        self.assertEqual(cj.next_action(last, self.now, 290 * 60, self.budget, self.bucket)[0], "stop")
+
+    def test_caught_up_sleeps_until_next_hour(self):
+        action, bucket, wait = cj.next_action(self.current, self.now, 60, self.budget, self.bucket)
+        self.assertEqual((action, bucket), ("sleep", None))
+        self.assertAlmostEqual(wait, (53 * 60) + 90)
+
+    def test_caught_up_near_end_stops(self):
+        # 자고 일어나 받으면 예산을 넘는다 → 멈추고 다음 실행에 넘긴다.
+        self.assertEqual(cj.next_action(self.current, self.now, 250 * 60, self.budget, self.bucket)[0], "stop")
+
+    def test_simulated_catch_up(self):
+        """3.3 req/s·버킷 9,000건이면 12버킷 밀림을 따라잡고, 그 뒤엔 매시 한 버킷씩 받는다."""
+        bucket_sec = 9000 / 3.3
+        clock = datetime(2026, 10, 30, 21, 20, tzinfo=KST)
+        last = datetime(2026, 10, 30, 9, 0, tzinfo=KST)
+        caught_up_at = None
+        run_elapsed = 0.0
+        for _ in range(500):
+            action, bucket, wait = cj.next_action(last, clock, run_elapsed, self.budget, bucket_sec)
+            if action == "crawl":
+                clock += timedelta(seconds=bucket_sec)
+                run_elapsed += bucket_sec
+                last = bucket
+            elif action == "sleep":
+                if caught_up_at is None:
+                    caught_up_at = clock
+                clock += timedelta(seconds=wait)
+                run_elapsed += wait
+            else:  # 다음 실행이 2분 뒤 이어 받는다
+                clock += timedelta(minutes=2)
+                run_elapsed = 0.0
+            if clock > datetime(2026, 11, 3, tzinfo=KST):
+                break
+        self.assertIsNotNone(caught_up_at)
+        hours = (caught_up_at - datetime(2026, 10, 30, 21, 20, tzinfo=KST)).total_seconds() / 3600
+        self.assertLess(hours, 48)
+        self.assertGreaterEqual(cj.floor_hour(last), cj.floor_hour(clock) - timedelta(hours=1))
+
+
+class RunBucketsTest(unittest.TestCase):
+    """긴 실행 루프: 밀린 버킷을 하나씩 받고 상태를 버킷마다 적고, 따라잡으면 자고, 예산이 차면 멈춘다."""
+
+    def setUp(self):
+        import contextlib
+        from unittest import mock
+
+        self.state = {"last": datetime(2026, 10, 30, 9, 0, tzinfo=KST)}
+        self.now = [datetime(2026, 10, 30, 10, 30, tzinfo=KST)]
+        self.mono = [0.0]
+        self.written, self.crawled, self.slept, self.vacuumed = [], [], [], []
+        test = self
+
+        class Engine:
+            @contextlib.contextmanager
+            def connect(self):
+                yield None
+
+        class FakeDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return test.now[0].astimezone(tz)
+
+        class Crawler:
+            strongs = list(range(1, 14))
+            gate = cj.RateGate(4)
+
+            def __init__(self):
+                self.stats = cj.CrawlStats()
+
+            def crawl(self, label, spids):
+                test.crawled.append(label)
+                secs = 2700.0  # 버킷 하나 45분
+                test.now[0] += timedelta(seconds=secs)
+                test.mono[0] += secs
+                self.stats.done += len(spids) * 13
+                self.stats.busy += secs
+                self.stats.changed += 1
+                return True
+
+        def sleep(s):
+            test.slept.append(s)
+            test.now[0] += timedelta(seconds=s)
+            test.mono[0] += s
+
+        patches = [
+            mock.patch.object(cj, "read_last_bucket", lambda conn: test.state["last"]),
+            mock.patch.object(cj, "write_last_bucket", lambda e, at: (test.written.append(at), test.state.update(last=at))),
+            mock.patch.object(cj, "load_bucket", lambda conn, at, cap: ([], [1] * 170, [2] * 520)),
+            mock.patch.object(cj, "_vacuum", lambda e: test.vacuumed.append(test.state["last"])),
+            mock.patch.object(cj, "datetime", FakeDatetime),
+            mock.patch.object(cj.time, "monotonic", lambda: test.mono[0]),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.engine, self.crawler, self.sleep = Engine(), Crawler(), sleep
+
+    def test_catches_up_then_sleeps_then_stops_within_budget(self):
+        ok = cj.run_buckets(self.engine, self.crawler, 330 * 60, 100, sleep=self.sleep)
+        self.assertTrue(ok)
+        # 10시부터 한 시간씩 빠짐없이, 순서대로 적었다.
+        self.assertEqual(self.written, [datetime(2026, 10, 30, 10, tzinfo=KST) + timedelta(hours=i)
+                                        for i in range(len(self.written))])
+        self.assertGreaterEqual(len(self.written), 6)
+        self.assertTrue(self.slept)                      # 따라잡은 뒤 다음 정시까지 잤다
+        self.assertLessEqual(self.mono[0], 330 * 60)     # 예산을 넘지 않았다
+        # VACUUM 은 KST 10·16시 같은 6시간 버킷에서만.
+        self.assertTrue(all(cj.hot_slot(at) % 6 == 4 for at in self.vacuumed))
+        self.assertIn(datetime(2026, 10, 30, 10, tzinfo=KST), self.vacuumed)
+
+    def test_blocked_stops_without_writing(self):
+        self.crawler.crawl = lambda label, spids: False
+        self.assertFalse(cj.run_buckets(self.engine, self.crawler, 330 * 60, 100, sleep=self.sleep))
+        self.assertEqual(self.written, [])
 
 
 class BucketSpidsTest(unittest.TestCase):
