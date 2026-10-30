@@ -1093,15 +1093,32 @@ def read_target_spids(conn, only_new: bool, stale_hours: int = 0) -> List[int]:
     return [r[0] for r in conn.execute(text(sql), {"h": stale_hours}).all()]
 
 
-def split_missing(missing: List[int], population: int, successes: int) -> Tuple[List[int], int]:
+def split_missing(missing: List[int], population: int, site_up: bool) -> Tuple[List[int], int]:
     """(숨길 spid, 실패로 셀 수). 넥슨 점검으로 보면 하나도 숨기지 않고 전부 실패로 센다:
-      · 같은 샤드에서 한 장도 열리지 않았거나,
+      · 정상 카드가 열리지 않았거나(site_up=False — 샤드 성공 0장이면 대조군으로 확인),
       · 오류 페이지가 샤드 몫의 전체 카드(population) 대비 상한 비율을 넘을 때.
     population 은 풀크롤이면 샤드 대상 수, 실패분 재확인이면 전체 카드 ÷ 샤드 수다 —
-    재확인 대상은 원래 실패한 카드라 대부분 오류 페이지인 게 정상이다(2026-10-30 1362/1404)."""
-    if missing and (successes == 0 or len(missing) / max(population, 1) > _MISSING_HIDE_MAX_RATIO):
+    재확인 대상은 원래 실패한 카드라 전부 오류 페이지일 수도 있다(2026-10-30 1360/1360)."""
+    if missing and (not site_up or len(missing) / max(population, 1) > _MISSING_HIDE_MAX_RATIO):
         return [], len(missing)
     return sorted(missing), 0
+
+
+# 샤드에서 한 장도 안 열렸을 때 넥슨이 살아 있는지 볼 대조군: 최근에 정상 크롤된 카드.
+_CONTROL_SPIDS_SQL = text(f"""
+    SELECT s.spid FROM {PLAYER_SCHEMA}.spid s
+    JOIN {PLAYER_SCHEMA}.players p ON p.spid = s.spid AND NOT p.hidden
+    WHERE s.crawled = TRUE
+    ORDER BY s.crawled_at DESC NULLS LAST LIMIT 3
+""")
+
+
+def site_is_up(session, control_spids: List[int], max_retries: int) -> bool:
+    """대조군 카드가 하나라도 열리면 넥슨은 정상이다."""
+    for spid in control_spids:
+        if _fetch_and_parse(session, spid, max_retries, 0)[1] is not None:
+            return True
+    return False
 
 
 def _record_missing(conn, run_id: str, shard: int, missing: List[int],
@@ -1401,7 +1418,13 @@ def crawl_shard(engine, run_id: str) -> None:
         resolver.close()
         newly_missing = 0
         if track_missing:
-            to_hide, outage = split_missing(missing, population, succeeded)
+            site_up = succeeded > 0
+            if missing and not site_up:
+                controls = [r[0] for r in engine_conn.execute(_CONTROL_SPIDS_SQL).all()]
+                engine_conn.commit()
+                site_up = site_is_up(session, controls, max_retries)
+                logger.info("성공 0장 — 대조군 %s 확인: 넥슨 %s", controls, "정상" if site_up else "응답 없음")
+            to_hide, outage = split_missing(missing, population, site_up)
             if outage:
                 logger.warning("오류 페이지 %d장(샤드 몫 %d장, 성공 %d장) — 점검으로 보고 숨기지 않습니다",
                                outage, population, succeeded)

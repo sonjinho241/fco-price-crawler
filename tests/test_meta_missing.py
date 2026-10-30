@@ -59,24 +59,30 @@ class CardMissingTest(unittest.TestCase):
 class SplitMissingTest(unittest.TestCase):
     def test_card_move_is_hidden(self):
         # 실제 이동: 샤드당 약 6%
-        hide, outage = m.split_missing([3, 1, 2], 50, 47)
+        hide, outage = m.split_missing([3, 1, 2], 50, True)
         self.assertEqual((hide, outage), ([1, 2, 3], 0))
 
     def test_mass_error_page_is_outage(self):
-        hide, outage = m.split_missing(list(range(20)), 100, 80)
+        hide, outage = m.split_missing(list(range(20)), 100, True)
         self.assertEqual((hide, outage), ([], 20))
 
-    def test_recheck_mostly_missing_is_hidden(self):
-        # 실패분 재확인: 대상 1404장 중 1362장이 오류 페이지여도 샤드 몫(약 2.2만) 대비 6%
-        hide, outage = m.split_missing(list(range(1362)), 22345, 42)
-        self.assertEqual((len(hide), outage), (1362, 0))
+    def test_recheck_all_missing_is_hidden(self):
+        # 실패분 재확인: 대상 1360장이 전부 오류 페이지여도 넥슨이 살아 있으면 숨긴다
+        hide, outage = m.split_missing(list(range(1360)), 23711, True)
+        self.assertEqual((len(hide), outage), (1360, 0))
 
-    def test_no_success_is_outage(self):
-        hide, outage = m.split_missing(list(range(10)), 22345, 0)
+    def test_site_down_is_outage(self):
+        hide, outage = m.split_missing(list(range(10)), 23711, False)
         self.assertEqual((hide, outage), ([], 10))
 
     def test_nothing_missing(self):
-        self.assertEqual(m.split_missing([], 0, 0), ([], 0))
+        self.assertEqual(m.split_missing([], 0, False), ([], 0))
+
+    def test_site_is_up_by_control(self):
+        answers = {1: (1, None, m.MISSING), 2: (2, {"name": "x"}, None)}
+        with mock.patch.object(m, "_fetch_and_parse", lambda s, spid, r, d: answers[spid]):
+            self.assertTrue(m.site_is_up(None, [1, 2], 3))
+            self.assertFalse(m.site_is_up(None, [1], 3))
 
 
 class LastMissingTest(unittest.TestCase):
