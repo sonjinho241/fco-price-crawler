@@ -26,6 +26,10 @@ on:
         description: "스모크 테스트용 spid 수 상한 (dispatch 는 ONLY_NEW 게이트 없이 앞에서부터 limit 장 크롤). 0 = 실전 실행(신규만 즉시 반영)"
         required: false
         default: "30"
+      seed_large_seasons:
+        description: "시드 상한(1000장)을 넘어도 끝까지 시드할 시즌 ID, 콤마 구분(예 325). 사람이 확인한 시즌만, limit 은 0 으로"
+        required: false
+        default: ""
 
 # 🔒 시크릿(DB·카카오·SMTP)은 코드에 두지 않는다. pull_request 트리거 금지(시크릿 노출 방지).
 permissions:
@@ -60,6 +64,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           META_MODE: sync
           META_LIMIT: ${{ github.event.inputs.limit || '0' }}
+          META_SEED_LARGE_SEASONS: ${{ github.event.inputs.seed_large_seasons || '' }}
         run: python meta_crawler.py
 
   # ── 2) crawl: 신규 감지된 시각에만, crawled=FALSE 인 spid 만 크롤(경량 단일 잡) ──

@@ -27,6 +27,10 @@ on:
         description: "테스트용 spid 수 상한 (0=전체)"
         required: false
         default: "0"
+      recheck_stale_hours:
+        description: "0=풀크롤. N 이면 crawl 이 N시간 안에 성공한 적 없는 카드(지난 풀크롤 실패분)만 다시 묻는다 — 오류 페이지 카드 숨김 재확인용"
+        required: false
+        default: "0"
 
 # 🔒 시크릿(DB·카카오·SMTP)은 코드에 두지 않는다. pull_request 트리거 금지(시크릿 노출 방지).
 permissions:
@@ -83,6 +87,7 @@ jobs:
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_COUNT: "4"
           META_LIMIT: ${{ github.event.inputs.limit || '0' }}
+          META_RECHECK_STALE_HOURS: ${{ github.event.inputs.recheck_stale_hours || '0' }}
         run: python meta_crawler.py
 
   # ── 3) career: 클럽 경력 전량 재크롤, 바뀐 선수만 write (+ 소속 필터 파생 갱신) ──

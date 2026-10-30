@@ -13,7 +13,9 @@ FC Online 선수 "클럽 경력" 주간 갱신 배치 — 공개 저장소용 �
 
 클럽 경력은 카드(spid)가 아니라 실존 선수(pid = spid % 1000000)의 속성이다(시즌이
 달라도 같음 — 2026-10 이적 선수 36명 최소/최대 시즌 카드 교차 확인). 그래서 pid 당
-대표 spid(MIN) 1장만 요청한다(~5.1만 요청, 카드 수의 약 절반).
+대표 spid(MIN) 1장만 요청한다(~5.1만 요청, 카드 수의 약 절반). 대표는 숨긴 카드(hidden)를
+빼고 고른다 — 2026-10-30 넥슨이 지난 시즌 LIVE 카드를 300 에서 325 로 옮기자 MIN 이 오류
+페이지로 넘어가는 300 카드를 골라 실패율 상한에 걸려 중단됐다. 숨김은 메타 풀크롤이 먼저 한다.
 
 모드(CAREER_MODE):
   full    : 모든 pid 재크롤 → 바뀐 것만 write. meta-friday.yml 에서 능력치 풀크롤 뒤에 돈다.
@@ -211,6 +213,7 @@ def club_rows_for_career(career: List[dict],
 _TARGETS_FULL_SQL = text(f"""
     SELECT (spid % {PID_MOD}) AS pid, MIN(spid) AS rep_spid
     FROM {PLAYER_SCHEMA}.players
+    WHERE NOT hidden
     GROUP BY 1
     ORDER BY 1
 """)
@@ -218,7 +221,7 @@ _TARGETS_FULL_SQL = text(f"""
 _TARGETS_PENDING_SQL = text(f"""
     SELECT (p.spid % {PID_MOD}) AS pid, MIN(p.spid) AS rep_spid
     FROM {PLAYER_SCHEMA}.players AS p
-    WHERE NOT EXISTS (
+    WHERE NOT p.hidden AND NOT EXISTS (
         SELECT 1 FROM {PLAYER_SCHEMA}.player_career AS c
         WHERE c.pid = (p.spid % {PID_MOD})
     )

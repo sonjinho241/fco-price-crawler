@@ -156,6 +156,8 @@ def aggregate(engine, run_id: str) -> dict:
     career = None         # career_job.py 결과(phase='career'). 잡이 안 돌았으면 None.
     gone_total = 0        # 넥슨이 지워 크롤에서 뺀 spid 수(phase='gone', 금요일만)
     newly_gone = []       # 그중 이번 주에 새로 사라진 것
+    missing_total = 0     # 넥슨이 오류 페이지로 돌려 숨긴 카드 수(phase='missing', 풀크롤 샤드별)
+    newly_missing = []    # 그중 이번에 처음 숨긴 것
 
     for r in rows:
         if r["phase"] == "gone":
@@ -163,6 +165,11 @@ def aggregate(engine, run_id: str) -> dict:
             detail = r["new_spids"] or {}
             gone_total = len(detail.get("gone") or [])
             newly_gone = list(detail.get("newly_gone") or [])
+        elif r["phase"] == "missing":
+            # missing 행도 new_spids 칸에 세부 dict 를 담는다(meta_crawler._record_missing).
+            detail = r["new_spids"] or {}
+            missing_total += len(detail.get("missing") or [])
+            newly_missing.extend(detail.get("newly_missing") or [])
         elif r["phase"] == "career":
             # career 행은 new_spids 칸에 세부 dict 를 담는다(career_job._log_result).
             detail = r["new_spids"] or {}
@@ -197,6 +204,7 @@ def aggregate(engine, run_id: str) -> dict:
     top_changed = _top_changed_players(engine, run_id, top_n) if changed else []
     # 사라진 카드도 players 행은 남아 있어 신규 미리보기와 같은 조회로 이름을 얻는다.
     top_gone = _top_new_players(engine, newly_gone, top_n)
+    top_missing = _top_new_players(engine, newly_missing, top_n)
 
     return {
         "run_id": run_id,
@@ -216,6 +224,9 @@ def aggregate(engine, run_id: str) -> dict:
         "gone_total": gone_total,
         "newly_gone_count": len(newly_gone),
         "top_gone": top_gone,
+        "missing_total": missing_total,
+        "newly_missing_count": len(newly_missing),
+        "top_missing": top_missing,
         # 워크플로가 career 잡을 돌렸는데 로그가 없으면(잡이 로그 전에 죽음) 경고 줄을 띄운다.
         "career_expected": os.getenv("EXPECT_CAREER", "0") == "1",
     }
@@ -307,6 +318,10 @@ def build_message(s: dict, max_len: Optional[int] = None) -> str:
     if s.get("newly_gone_count"):
         lines.append("• 사라진 카드(크롤 제외): "
                      + _card_preview(s["top_gone"], s["newly_gone_count"], unit="장"))
+    # 넥슨이 오류 페이지로 돌리는 카드(시즌 번호 이동 등)도 실패가 아니라 숨김으로 알린다.
+    if s.get("newly_missing_count"):
+        lines.append("• 넥슨 오류 페이지(검색 숨김): "
+                     + _card_preview(s["top_missing"], s["newly_missing_count"], unit="장"))
 
     career = s.get("career")
     career_quiet = (
@@ -318,7 +333,7 @@ def build_message(s: dict, max_len: Optional[int] = None) -> str:
     if (s["new_players"] == 0 and s["changed"] == 0 and not s["new_traits"]
             and not s.get("new_team_colors") and not s["new_seasons"]
             and s["failures"] == 0 and s["missing_shards"] == 0 and career_quiet
-            and not s.get("newly_gone_count")):
+            and not s.get("newly_gone_count") and not s.get("newly_missing_count")):
         lines.append("변동 없음 (정상 동작)")
 
     msg = "\n".join(lines)

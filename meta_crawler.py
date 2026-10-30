@@ -59,6 +59,13 @@ player.meta_crawl_log 에 적는다.
     META_DETECT_GONE        '1' 이면 sync 가 spid.json 에서 빠진 spid 를 'gone' 로그로 남기고
                             players.hidden 으로 앱 검색에서 뺀다. 돌아온 카드는 다시 띄운다
                             (금요일 풀크롤 전용, 기본 0)
+    META_SEED_LARGE_SEASONS 사람이 확인하고 시드를 허락한 큰 시즌 ID(콤마 구분, 예 325). 이 시즌은
+                            _SEED_MAX_CARDS 상한 없이 끝까지 긁어 시드한다 (기본 없음)
+    META_RECHECK_STALE_HOURS crawl 대상을 이 시간 안에 성공한 적 없는 크롤 완료 spid 로 한정한다
+                            — 풀크롤 실패분만 다시 묻는 수동 재확인 (기본 0=끔)
+
+풀크롤은 넥슨이 오류 페이지로 돌리는 카드(CardMissing)를 실패로 세지 않고 phase='missing'
+로그로 남겨 players.hidden 으로 숨긴다. 다시 열리면 다음 풀크롤이 숨김을 푼다.
 
 로컬 테스트:
     DATABASE_URL=postgresql://... META_MODE=sync python meta_crawler.py
@@ -164,8 +171,22 @@ def make_session() -> requests.Session:
     return s
 
 
+class CardMissing(Exception):
+    """넥슨이 카드 상세를 오류 페이지로 돌린다 = 그 spid 의 카드가 넥슨에 없다.
+
+    2026-10-30 넥슨이 지난 시즌 LIVE 카드 5,614장을 300 에서 325 로 옮기자, 300 쪽 상세가
+    302 → bulletin.nexon.com/nxk/error.html 로 넘어갔다. spid.json 은 그 카드를 여전히 300 으로
+    싣고 있어 'gone' 판정으로는 잡히지 않는다. 재시도해도 같으므로 바로 포기한다.
+    """
+
+
+_ERROR_PAGE_HOST = "bulletin.nexon.com"
+
+
 def fetch_player_html(session: requests.Session, spid: int, timeout: int = 12) -> str:
     res = session.get(f"{ABILITY_URL}?spid={spid}&n1Strong=1", timeout=timeout)
+    if res.history and _ERROR_PAGE_HOST in res.url:
+        raise CardMissing(spid)
     res.raise_for_status()
     return res.text
 
@@ -467,7 +488,9 @@ _SEED_RECENT_SEASONS = 10        # 시드 대상은 seasonid 상위 N개 중 spi
 _DATACENTER_LIST_CAP = 200       # PlayerList 한 번에 오는 최대 장수(페이지 넘김 없음)
 _SALARY_MIN, _SALARY_MAX = 0, 99  # 상한에 닿으면 이 급여 구간을 반씩 나눠 다시 묻는다
 _OVR_MIN, _OVR_MAX = 1, 199        # 급여 한 값에서도 닿으면 OVR 구간을 반씩 나눈다
+_HEIGHT_MIN, _HEIGHT_MAX = 100, 250  # 급여·OVR 한 값에서도 닿으면 키 구간을 반씩 나눈다
 _SEED_MAX_CARDS = 1000            # 이보다 큰 시즌은 시드하지 않는다(재발행된 LIVE 등, 사람이 판단)
+                                  # 사람이 판단했으면 META_SEED_LARGE_SEASONS 로 그 시즌만 연다
 _PLAYERUNIT_RE = re.compile(r"area_playerunit_(\d+)")
 
 # 시드 후보: 최근 시즌 중 player.spid 에 한 건도 없는 시즌. 8.8만 행 정수 나눗셈 1회라 가볍다.
@@ -491,12 +514,15 @@ _SEASONS_WITHOUT_SPIDS_SQL = text(f"""
 def fetch_player_list_page(session: requests.Session, season_id: int, page: int,
                            timeout: int = 20,
                            salary: Optional[Tuple[int, int]] = None,
-                           ovr: Optional[Tuple[int, int]] = None) -> str:
+                           ovr: Optional[Tuple[int, int]] = None,
+                           height: Optional[Tuple[int, int]] = None) -> str:
     data = {"strSeason": f",{season_id},", "n4PageNo": page}
     if salary is not None:
         data["n4SalaryMin"], data["n4SalaryMax"] = salary
     if ovr is not None:
         data["n4OvrMin"], data["n4OvrMax"] = ovr
+    if height is not None:
+        data["n4HeightMin"], data["n4HeightMax"] = height
     res = session.post(
         PLAYER_LIST_URL,
         data=data,
@@ -535,19 +561,22 @@ class _TooManyCards(Exception):
     pass
 
 
-def fetch_season_spids_from_datacenter(session: requests.Session, season_id: int) -> Dict[int, str]:
+def fetch_season_spids_from_datacenter(session: requests.Session, season_id: int,
+                                       max_cards: Optional[int] = _SEED_MAX_CARDS) -> Dict[int, str]:
     """시즌 하나의 spid 전부를 긁는다. 요청이 하나라도 실패하면 빈 dict(반쪽 시드 방지 —
     spid 가 한 건이라도 들어가면 그 시즌은 다음 폴링의 시드 후보에서 빠진다).
 
     데이터센터는 검색 한 번에 최대 _DATACENTER_LIST_CAP 장만 주고 n4PageNo 는 무시한다
     (2026-10-29 실측: 26UP 205장이 1·2·3페이지 모두 같은 200장). 상한에 닿으면 급여
-    구간을 반으로 나눠 다시 묻고, 급여 한 값에서도 닿으면(LIVE 시즌은 수천 장) OVR 구간을
-    나눈다.
+    구간을 반으로 나눠 다시 묻고, 급여 한 값에서도 닿으면(LIVE 시즌은 수천 장) OVR 구간을,
+    OVR 한 값에서도 닿으면 키 구간을 나눈다(2026-10-30 25 LIVE 325: 급여 5·OVR 51 에 200장 →
+    키 ≤180 117장 + 181~ 129장). max_cards=None 이면 상한 없이 끝까지 긁는다.
     """
     found: Dict[int, str] = {}
 
-    def collect(salary: Tuple[int, int], ovr: Optional[Tuple[int, int]]) -> None:
-        html = fetch_player_list_page(session, season_id, 1, salary=salary, ovr=ovr)
+    def collect(salary: Tuple[int, int], ovr: Optional[Tuple[int, int]],
+                height: Optional[Tuple[int, int]] = None) -> None:
+        html = fetch_player_list_page(session, season_id, 1, salary=salary, ovr=ovr, height=height)
         items = parse_player_list(html, season_id)
         time.sleep(0.3)
         if len(items) >= _DATACENTER_LIST_CAP:
@@ -562,10 +591,16 @@ def fetch_season_spids_from_datacenter(session: requests.Session, season_id: int
                 collect(salary, (lo, mid))
                 collect(salary, (mid + 1, hi))
                 return
-            logger.warning("시드 시즌=%s 급여=%d OVR=%d 한 값에 %d장 — 일부 누락 가능(금요일 풀크롤이 채움)",
-                           season_id, salary[0], lo, len(items))
+            h_lo, h_hi = height or (_HEIGHT_MIN, _HEIGHT_MAX)
+            if h_lo < h_hi:
+                mid = (h_lo + h_hi) // 2
+                collect(salary, ovr, (h_lo, mid))
+                collect(salary, ovr, (mid + 1, h_hi))
+                return
+            logger.warning("시드 시즌=%s 급여=%d OVR=%d 키=%d 한 값에 %d장 — 일부 누락 가능(금요일 풀크롤이 채움)",
+                           season_id, salary[0], lo, h_lo, len(items))
         found.update(items)
-        if len(found) > _SEED_MAX_CARDS:
+        if max_cards is not None and len(found) > max_cards:
             raise _TooManyCards()
 
     try:
@@ -620,16 +655,20 @@ def _seed_spids_from_datacenter(engine, session: requests.Session, run_id: str,
             {"recent": _SEED_RECENT_SEASONS, "extra": _pg_array_literal(extra_season_ids)},
         ).all()
 
+    large_ok = set(_env_int_list("META_SEED_LARGE_SEASONS"))
     all_inserted: List[int] = []
     seeded_seasons: List[dict] = []
     for season_id, class_name in candidates:
-        items = fetch_season_spids_from_datacenter(session, season_id)   # 커넥션 없이
+        items = fetch_season_spids_from_datacenter(   # 커넥션 없이
+            session, season_id, None if season_id in large_ok else _SEED_MAX_CARDS)
         if not items:
             logger.info("시드 시즌=%s(%s): 데이터센터에도 아직 0건", season_id, class_name)
             continue
-        if len(items) > _SEED_MAX_CARDS:
-            # 2026-10-29 데이터센터에 25 LIVE 가 325 번으로 다시 올라왔다(300 과 같은 선수들,
-            # 수천 장). 출시 당일 신규 시즌은 수백 장이라, 이만큼 크면 사람이 판단할 일이다.
+        if len(items) > _SEED_MAX_CARDS and season_id not in large_ok:
+            # 2026-10-29 데이터센터에 25 LIVE 가 325 번으로 다시 올라왔다. 300 은 26 LIVE 가
+            # 되고, 지난 시즌 LIVE 카드 일부(5,614장)는 300 에서 325 로 옮겨졌다 — 300 쪽 상세는
+            # 넥슨 오류 페이지로 넘어간다. 출시 당일 신규 시즌은 수백 장이라, 이만큼 크면 사람이
+            # 판단할 일이다(판단했으면 META_SEED_LARGE_SEASONS 로 연다).
             logger.warning("시드 시즌=%s(%s): 데이터센터 %d건 — 상한 %d 초과라 건너뜀",
                            season_id, class_name, len(items), _SEED_MAX_CARDS)
             continue
@@ -705,8 +744,15 @@ def seed_probe() -> None:
 # 행은 지우지 않고 players.hidden=TRUE 로 앱 검색에서만 뺀다(서버가 목록성 조회에서 거른다.
 # 상세·저장된 스쿼드 복원은 그대로 보인다). 넥슨이 되살리면 다음 금요일 sync 가 hidden 을
 # 풀고, 자동으로 다시 크롤 대상이 된다.
-# ⚠️ 그래서 hidden 은 이 판정이 소유한다 — spid.json 에 있는 카드를 손으로 숨겨도 금요일에
-#    풀린다. 다른 이유로 숨길 일이 생기면 별도 컬럼을 둘 것.
+# ⚠️ 그래서 hidden 은 이 판정과 아래 'missing' 판정 둘이 소유한다 — spid.json 에 있는 카드를
+#    손으로 숨겨도 금요일에 풀린다. 다른 이유로 숨길 일이 생기면 별도 컬럼을 둘 것.
+#
+# ── 넥슨이 오류 페이지로 돌리는 카드(spid.json 에는 남아 있는 spid) ─────────────────
+# 풀크롤이 CardMissing 을 받은 spid 를 샤드마다 phase='missing' 로그로 남기고 숨긴다. 크롤
+# 대상에서는 빼지 않는다 — 다음 풀크롤도 한 번씩(재시도 없이) 물어보고, 열리면 숨김을 푼다.
+# sync 의 되살림은 가장 최근 풀크롤의 missing 목록을 빼고 판단한다(spid.json 에 있다고 풀면
+# 같은 카드가 매주 sync~crawl 사이 1시간씩 검색에 다시 뜬다).
+# 넥슨 점검처럼 한꺼번에 오류 페이지가 뜨면 숨기지 않고 실패로 센다(_MISSING_HIDE_MAX_RATIO).
 _ALL_CRAWLED_SPIDS_SQL = text(f"""
     SELECT spid, crawled_at FROM {PLAYER_SCHEMA}.spid WHERE crawled = TRUE
 """)
@@ -734,6 +780,28 @@ _UNHIDE_SPIDS_SQL = text(f"""
     WHERE spid = ANY(CAST(:spids AS bigint[])) AND hidden = TRUE
 """)
 
+MISSING = "missing"   # _fetch_and_parse 의 오류 표식(CardMissing)
+
+# 한 샤드에서 이보다 큰 비율이 오류 페이지면 카드가 옮겨진 게 아니라 넥슨 점검으로 본다.
+# 2026-10-30 실제 이동은 샤드당 약 6%(1,400/22,345)였다.
+_MISSING_HIDE_MAX_RATIO = 0.15
+
+# 가장 최근에 missing 을 남긴 풀크롤 run 의 목록(샤드 행 전부). 다음 풀크롤 전까지 유효하다.
+_LAST_MISSING_SQL = text(f"""
+    SELECT new_spids FROM {PLAYER_SCHEMA}.meta_crawl_log
+    WHERE phase = 'missing' AND run_id = (
+        SELECT run_id FROM {PLAYER_SCHEMA}.meta_crawl_log
+        WHERE phase = 'missing' ORDER BY created_at DESC LIMIT 1
+    )
+""")
+
+
+def read_last_missing_spids(conn) -> set:
+    missing: set = set()
+    for (detail,) in conn.execute(_LAST_MISSING_SQL):
+        missing.update((detail or {}).get("missing") or [])
+    return missing
+
 
 def _log_gone_spids(engine, run_id: str, player_data: list) -> None:
     listed = {int(p["id"]) for p in player_data}
@@ -753,8 +821,10 @@ def _log_gone_spids(engine, run_id: str, player_data: list) -> None:
         gone.sort()
         newly_gone.sort()
 
-        # 앱 검색에서 빼고, spid.json 에 돌아온 카드는 다시 띄운다. 숨긴 카드는 몇 장뿐이라
+        # 앱 검색에서 빼고, spid.json 에 돌아온 카드는 다시 띄운다. 숨긴 카드는 수천 장 이하라
         # 되살아남 판정은 파이썬에서 한다(8.8만 spid 를 배열로 넘기지 않는다).
+        # 오류 페이지로 숨긴 카드는 spid.json 에 계속 있으므로 여기서 풀지 않는다(풀크롤 몫).
+        still_missing = read_last_missing_spids(conn)
         hidden_now = 0
         if len(gone) > _GONE_HIDE_MAX:
             logger.warning(
@@ -766,7 +836,8 @@ def _log_gone_spids(engine, run_id: str, player_data: list) -> None:
                 _HIDE_SPIDS_SQL, {"spids": _pg_array_literal(gone)}
             ).rowcount
         revived = sorted(
-            r.spid for r in conn.execute(_HIDDEN_SPIDS_SQL) if r.spid in listed
+            r.spid for r in conn.execute(_HIDDEN_SPIDS_SQL)
+            if r.spid in listed and r.spid not in still_missing
         )
         if revived:
             conn.execute(_UNHIDE_SPIDS_SQL, {"spids": _pg_array_literal(revived)})
@@ -920,6 +991,12 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_int_list(name: str) -> List[int]:
+    """'325, 326' → [325, 326]. 숫자가 아닌 조각은 버린다."""
+    raw = os.getenv(name) or ""
+    return [int(x) for x in raw.replace(" ", "").split(",") if x.isdigit()]
+
+
 def _shard(items: List[int]) -> Tuple[List[int], int, int]:
     index = _env_int("SHARD_INDEX", 0)
     count = _env_int("SHARD_COUNT", 1)
@@ -928,14 +1005,52 @@ def _shard(items: List[int]) -> Tuple[List[int], int, int]:
     return items[index::count], index, count
 
 
-def read_target_spids(conn, only_new: bool) -> List[int]:
+def read_target_spids(conn, only_new: bool, stale_hours: int = 0) -> List[int]:
     """크롤 대상 spid. only_new=True 면 crawled=FALSE(=sync 가 방금 넣은 신규 +
-    과거 크롤 실패분)만 — 목요일 폴링의 경량 크롤 모드."""
+    과거 크롤 실패분)만 — 목요일 폴링의 경량 크롤 모드.
+
+    stale_hours>0 이면 그 시간 안에 한 번도 성공하지 못한 크롤 완료 spid 만 — 풀크롤의
+    실패분(오류 페이지 포함)만 다시 묻는 수동 재확인. 성공해야 crawled_at 이 갱신된다."""
     if only_new:
         sql = f"SELECT spid FROM {PLAYER_SCHEMA}.spid WHERE crawled = FALSE ORDER BY spid"
+    elif stale_hours > 0:
+        sql = (f"SELECT spid FROM {PLAYER_SCHEMA}.spid WHERE crawled = TRUE "
+               f"AND crawled_at < now() - make_interval(hours => :h) ORDER BY spid")
     else:
         sql = f"SELECT spid FROM {PLAYER_SCHEMA}.spid ORDER BY spid"
-    return [r[0] for r in conn.execute(text(sql)).all()]
+    return [r[0] for r in conn.execute(text(sql), {"h": stale_hours}).all()]
+
+
+def split_missing(missing: List[int], total: int) -> Tuple[List[int], int]:
+    """(숨길 spid, 실패로 셀 수). 오류 페이지가 샤드의 상한 비율을 넘으면 점검으로 보고
+    하나도 숨기지 않고 전부 실패로 센다."""
+    if total and len(missing) / total > _MISSING_HIDE_MAX_RATIO:
+        return [], len(missing)
+    return sorted(missing), 0
+
+
+def _record_missing(conn, run_id: str, shard: int, missing: List[int],
+                    hidden_before: set, revived: List[int]) -> int:
+    """오류 페이지 카드를 숨기고, 다시 열린 카드는 풀고, phase='missing' 로그를 남긴다.
+    newly_missing(이번에 처음 숨긴 카드)만 알림에 쓴다 — 같은 카드를 매주 알리지 않게."""
+    newly = [s for s in missing if s not in hidden_before]
+    if missing:
+        conn.execute(_HIDE_SPIDS_SQL, {"spids": _pg_array_literal(missing)})
+    if revived:
+        conn.execute(_UNHIDE_SPIDS_SQL, {"spids": _pg_array_literal(revived)})
+    conn.execute(
+        text(f"""
+            INSERT INTO {PLAYER_SCHEMA}.meta_crawl_log
+                (run_id, phase, shard, new_players, new_spids)
+            VALUES (:rid, 'missing', :shard, :n, CAST(:detail AS jsonb))
+        """),
+        {
+            "rid": run_id, "shard": shard, "n": len(newly),
+            "detail": json.dumps({"missing": missing, "newly_missing": newly, "revived": revived}),
+        },
+    )
+    conn.commit()
+    return len(newly)
 
 
 # 카드마다 SELECT 1회(왕복 ~150ms)를 없애기 위해, 샤드가 맡은 spid 들의
@@ -1052,6 +1167,10 @@ def _fetch_and_parse(session, spid, max_retries, delay):
             if delay:
                 time.sleep(delay)
             return spid, parsed, None
+        except CardMissing:
+            if delay:
+                time.sleep(delay)
+            return spid, None, MISSING
         except requests.RequestException as exc:
             last_err = f"net:{exc}"
         except ValueError as exc:        # 불완전 HTML(이름/포지션 없음) → 일시적일 수 있음
@@ -1067,6 +1186,10 @@ def crawl_shard(engine, run_id: str) -> None:
     max_retries = _env_int("META_MAX_RETRIES", 3)
     spid_limit = _env_int("META_LIMIT", 0)
     only_new = _env_int("META_ONLY_NEW", 0) == 1
+    stale_hours = _env_int("META_RECHECK_STALE_HOURS", 0)
+    # 오류 페이지 숨김/되살림은 풀크롤(또는 그 실패분 재확인)만 판단한다. 목요일 신규 크롤과
+    # META_LIMIT 스모크는 일부만 보므로 missing 목록을 남기면 sync 의 되살림 판단이 틀어진다.
+    track_missing = not only_new and spid_limit == 0
 
     session = make_session()
     adapter = requests.adapters.HTTPAdapter(
@@ -1076,7 +1199,7 @@ def crawl_shard(engine, run_id: str) -> None:
 
     engine_conn = engine.connect()
     with engine_conn:
-        all_spids = read_target_spids(engine_conn, only_new)
+        all_spids = read_target_spids(engine_conn, only_new, 0 if only_new else stale_hours)
         gone = set() if only_new else read_gone_spids(engine_conn, run_id)
         if gone:
             # 샤드 분할 전에 빼야 모든 샤드가 같은 목록을 같은 방식으로 나눈다.
@@ -1086,9 +1209,13 @@ def crawl_shard(engine, run_id: str) -> None:
             all_spids = all_spids[:spid_limit]
         spids, index, count = _shard(all_spids)
         existing_map = _load_existing(engine_conn, spids)
+        shard_set = set(spids)
+        hidden_before = {
+            r.spid for r in engine_conn.execute(_HIDDEN_SPIDS_SQL) if r.spid in shard_set
+        }
         engine_conn.commit()   # 프리로드 SELECT 가 연 트랜잭션/스냅샷을 닫아둔다
-        logger.info("crawl 샤드 %d/%d → %d spids (only_new=%s, workers=%d, delay=%.2fs)",
-                    index, count, len(spids), only_new, workers, delay)
+        logger.info("crawl 샤드 %d/%d → %d spids (only_new=%s, stale_hours=%d, workers=%d, delay=%.2fs)",
+                    index, count, len(spids), only_new, stale_hours, workers, delay)
 
         resolver = RefResolver(engine)
         # 이번 run 시작 전 trait id 스냅샷(신규 특성 정확 감지용).
@@ -1113,6 +1240,8 @@ def crawl_shard(engine, run_id: str) -> None:
         done = 0
         started = time.monotonic()
         mark_buf: List[int] = []
+        missing: List[int] = []
+        revived: List[int] = []
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [
@@ -1122,6 +1251,9 @@ def crawl_shard(engine, run_id: str) -> None:
             for fut in as_completed(futures):
                 spid, parsed, err = fut.result()
                 done += 1
+                if err == MISSING and track_missing:
+                    missing.append(spid)   # 샤드 끝에서 한 번에 숨긴다(줄마다 경고를 찍지 않는다)
+                    continue
                 if err is not None:
                     failures += 1
                     logger.warning("실패 spid=%s: %s", spid, err)
@@ -1168,6 +1300,8 @@ def crawl_shard(engine, run_id: str) -> None:
                             seen_new_team_colors[cid] = tc["name"]
                             known_team_color_ids.add(cid)
 
+                    if spid in hidden_before:
+                        revived.append(spid)   # 오류 페이지였다가 다시 열린 카드
                     mark_buf.append(spid)
                     if len(mark_buf) >= _MARK_CHUNK:
                         _flush_marks(engine_conn, mark_buf)
@@ -1178,12 +1312,23 @@ def crawl_shard(engine, run_id: str) -> None:
 
                 if done % 500 == 0:
                     elapsed = time.monotonic() - started
-                    logger.info("진행 %d/%d 신규=%d 변경=%d 실패=%d %.1f req/s",
-                                done, len(spids), new_players, changed, failures,
+                    logger.info("진행 %d/%d 신규=%d 변경=%d 실패=%d 오류페이지=%d %.1f req/s",
+                                done, len(spids), new_players, changed, failures, len(missing),
                                 done / elapsed if elapsed else 0)
 
         _flush_marks(engine_conn, mark_buf)
         resolver.close()
+        newly_missing = 0
+        if track_missing:
+            to_hide, outage = split_missing(missing, len(spids))
+            if outage:
+                logger.warning("오류 페이지 %d/%d 장 — 상한 %.0f%% 초과라 점검으로 보고 숨기지 않습니다",
+                               outage, len(spids), _MISSING_HIDE_MAX_RATIO * 100)
+                failures += outage
+            newly_missing = _record_missing(engine_conn, run_id, index, to_hide,
+                                            hidden_before, revived)
+            logger.info("오류 페이지 카드 %d장 숨김(이번에 새로 %d), 다시 열려 노출 %d장: %s",
+                        len(to_hide), newly_missing, len(revived), to_hide[:20])
         new_traits_payload = [{"id": tid, "name": nm} for tid, nm in seen_new_traits.items()]
         new_team_colors_payload = [
             {"id": cid, "name": nm} for cid, nm in seen_new_team_colors.items()
@@ -1203,9 +1348,9 @@ def crawl_shard(engine, run_id: str) -> None:
             },
         )
         engine_conn.commit()
-        logger.info("crawl 샤드 %d 완료: 신규=%d 변경=%d 신규특성=%d 신규팀컬러=%d 실패=%d",
+        logger.info("crawl 샤드 %d 완료: 신규=%d 변경=%d 신규특성=%d 신규팀컬러=%d 실패=%d 새오류페이지=%d",
                     index, new_players, changed, len(new_traits_payload),
-                    len(new_team_colors_payload), failures)
+                    len(new_team_colors_payload), failures, newly_missing)
 
 
 # =============================================================================
