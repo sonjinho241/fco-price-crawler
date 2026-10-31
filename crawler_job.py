@@ -231,8 +231,10 @@ def make_engine():
 
 
 def read_spids(conn) -> List[int]:
-    """검색 가능한 선수(players 테이블)의 spid 전체를 정렬해 반환."""
-    rows = conn.execute(text(f"SELECT DISTINCT spid FROM {PLAYERS_TABLE}")).all()
+    """검색 가능한 선수(players 테이블)의 spid 전체를 정렬해 반환. 숨긴 카드(hidden)는 뺀다 —
+    넥슨이 지우거나 다른 시즌 번호로 옮긴 카드라 현재가가 없다(2026-10-30 300→325 이동 5,437장:
+    300 쪽 시세는 현재가 없이 옛 추이만 온다). hot 도 이 목록과의 교집합이라 함께 빠진다."""
+    rows = conn.execute(text(f"SELECT DISTINCT spid FROM {PLAYERS_TABLE} WHERE NOT hidden")).all()
     return sorted({row[0] for row in rows})
 
 
@@ -241,7 +243,7 @@ def read_new_spids(conn) -> List[int]:
     (2026-10-29 26UP 출시 주 — 새 카드 시세가 없으면 개봉 시뮬레이터 상품이 통째로 숨겨진다)."""
     rows = conn.execute(text(
         f"SELECT DISTINCT p.spid FROM {PLAYERS_TABLE} p "
-        f"WHERE NOT EXISTS (SELECT 1 FROM {PLAYER_SCHEMA}.player_price_strongs s WHERE s.spid = p.spid)"
+        f"WHERE NOT p.hidden AND NOT EXISTS (SELECT 1 FROM {PLAYER_SCHEMA}.player_price_strongs s WHERE s.spid = p.spid)"
     )).all()
     return sorted({row[0] for row in rows})
 
