@@ -344,6 +344,9 @@ REACH_CTE = (
     "    jsonb_array_elements_text(cell->'choice_sns') AS c(sn) "
     "  UNION SELECT (x->>'sn')::int FROM live, "
     "    jsonb_array_elements(coalesce(live.config->'exchange', '[]'::jsonb)) AS x "
+    # 패키지 구성품(상자 + 선수팩 N개, 2026-11-01). 상자 밖에 얹어 주는 선수팩이라 하위 상자로는 안 닿는다.
+    "  UNION SELECT (c->>'sn')::int FROM live, "
+    "    jsonb_array_elements(coalesce(live.config->'contents', '[]'::jsonb)) AS c "
     "  UNION SELECT r.sub_sn FROM spend.prob_row r JOIN reach ON r.sn = reach.sn "
     "    WHERE r.sub_sn IS NOT NULL) "
 )

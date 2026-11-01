@@ -43,6 +43,12 @@ class ReachTest(unittest.TestCase):
         self.assertIn("g->'sns'", REACH_CTE)
         self.assertIn("g->'tables'", REACH_CTE)
 
+    def test_package_contents(self):
+        # 패키지(상자 + 26UP Top Price 1435 3개 등)에 얹은 선수팩은 상자 아래에 없다 — 빠지면 풀이 안 생겨
+        # 패키지째 앱에서 숨는다.
+        self.assertIn("live.config->'contents'", REACH_CTE)
+        self.assertIn("(c->>'sn')::int", REACH_CTE)
+
 
 if __name__ == "__main__":
     unittest.main()
