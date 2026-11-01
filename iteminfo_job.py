@@ -361,8 +361,18 @@ def reachable_top_price(engine) -> List[int]:
         ))]
 
 
+# 등급칸 코드가 시즌 이름과 달라 위 비교로 못 찾는 것. 26 프리미엄 라이브는 확률표가 '26PL', 시즌 이름이
+# '26PLA (26 Premium Live)' 다(2026-11-01 '26PL Top Price 5500 (1~11강)' = 519 시즌 500명 × 11강으로 확인).
+CLASS_CODE_ALIASES = {"26PL": "26PLA"}
+
+
+def _season_key(code: str) -> str:
+    key = ii.norm_code(code)
+    return CLASS_CODE_ALIASES.get(key, key)
+
+
 def _season_ids(conn, codes: Sequence[str]) -> Tuple[List[int], List[str]]:
-    keys = {ii.norm_code(c): c for c in codes}
+    keys = {_season_key(c): c for c in codes}
     found: Dict[str, List[int]] = {}
     for season_id, k in conn.execute(text(_SEASON_KEYS_SQL)):
         if k in keys:
