@@ -101,7 +101,7 @@ def _top_new_players(engine, spids: list, limit: int) -> list:
 #    meta_crawl_log.created_at 은 timestamptz 다. 세션 타임존에 의존하지 않도록
 #    AT TIME ZONE 'UTC' 로 명시 변환해서 비교한다.
 # ⚠️ 이 방식은 crawl 중 players 를 건드리는 다른 writer 가 없다는 전제에 기댄다.
-#    (시세 크롤러는 player_price_latest 만 쓴다. 이 전제가 깨지면 changed_spids 를
+#    (시세 크롤러는 player_price_strongs 만 쓴다. 이 전제가 깨지면 changed_spids 를
 #     meta_crawl_log 에 명시적으로 남기는 쪽으로 바꿔야 한다.)
 _RUN_SINCE_SQL = text("""
     SELECT min(created_at) AT TIME ZONE 'UTC'

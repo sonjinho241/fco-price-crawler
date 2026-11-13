@@ -1,6 +1,6 @@
 name: crawl-prices
 
-# 넥슨 시세(PlayerPriceGraph) → player_price_latest·player_price_strongs.
+# 넥슨 시세(PlayerPriceGraph) → player_price_strongs(카드당 한 행).
 # 공개 저장소이므로 GitHub Actions 분(分)은 무제한 → 비용 0원.
 #
 # ⚙️ 2026-10-30 부터 낮은 속도(전체 4 req/s 이하, 상한 5)로 시각 버킷을 하나씩 돈다.

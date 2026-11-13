@@ -2,8 +2,12 @@
 
 FC Online 선수 **"최신 시세만"** 일일 크롤러. 공개 저장소 + GitHub Actions(무료)에서
 하루 1회 새벽에 돌아가며, 넥슨에서 선수×강화단계당 *가장 최근 1줄*을 받아
-DB의 `player.player_price_latest` 테이블에 upsert 한다. 이 표 덕분에 메인 앱이
-`WHERE strong = ? AND price BETWEEN ? AND ?` 검색을 인덱스로 빠르게 태운다.
+DB의 `player.player_price_strongs` 테이블(카드당 한 행, 강화 1~13단계 배열)에 upsert 한다.
+메인 앱의 강화단계·시세 범위 검색과 개봉 시뮬레이터가 이 표를 읽는다.
+
+> ⚠️ 2026-11-13 부터 옛 표 `player.player_price_latest`((spid, strong) 마다 한 행)에는 쓰지 않는다.
+> 아래 일부 설명(하루 6토막 샤딩 등)은 그 전 구조라 낡았다 — 현재 스케줄은 `crawler_job.py` 머리말과
+> 메인 저장소 `docs/OPS-STATE.md` §4 가 기준이다.
 
 - **자기완결형**: `crawler_job.py` 하나로 끝. 메인(비공개) 앱 저장소를 체크아웃하지 않는다.
 - **멱등**: 중간에 죽어도 다시 돌리면 이어서 채워진다.
@@ -26,7 +30,7 @@ DB의 `player.player_price_latest` 테이블에 upsert 한다. 이 표 덕분에
   같은 로직의 **참고용 복사본일 뿐, 매일 실제로 DB 에 쓰는 건 여기다.**
 - **언제**: `.github/workflows/crawl.yml` 의 cron **6개**(UTC 20·0·4·8·12·16시 = KST 05·09·13·17·21·01시).
   각 cron 이 샤드 인덱스 0~5 중 하나를 맡아 전체 spid 의 1/6 을 크롤한다.
-- **무엇을**: 넥슨에서 선수×강화단계당 최신 1줄을 받아 `player.player_price_latest` 에 upsert.
+- **무엇을**: 넥슨에서 선수×강화단계당 최신 1줄을 받아 `player.player_price_strongs` 에 upsert.
   앱의 "강화단계+시세범위" **검색 필터 전용** 표다. (앱의 *시세 상세 그래프*는 이 표가 아니라
   메인 앱 `prices/router.py` 의 넥슨 **실시간 프록시**+12h 캐시에서 온다 — 별개 경로.)
 - **Disk IO 보호 2종**: ① 하루 6토막 샤딩으로 **순간 폭주(burst) 제거**, ② `bulk_upsert_latest` 의
@@ -176,7 +180,7 @@ sql/crawler_role.sql           # 최소권한 전용 DB 롤 생성 SQL (Supabase
 ### 1) 최소권한 DB 롤 만들기 (권장, 보안)
 Supabase → **SQL Editor** 에서 [`sql/crawler_role.sql`](sql/crawler_role.sql) 를 열고
 비밀번호 자리를 강력한 값으로 바꿔 실행한다. 이 롤은 `player.players` 읽기 +
-`player.player_price_latest` 읽기/쓰기만 가능하다(슈퍼유저 아님).
+`player.player_price_strongs` 읽기/쓰기 등 크롤러에 필요한 표만 다룰 수 있다(슈퍼유저 아님).
 
 접속문자열 형태 ⚠️ **반드시 "Session pooler"(IPv4) 주소를 쓸 것** — GitHub Actions 는
 IPv6 를 지원하지 않는데, Supabase 의 "직접 연결"(`db.<ref>.supabase.co`)은 IPv6 전용이라
@@ -197,8 +201,8 @@ postgresql://fco_crawler.<프로젝트ref>:비밀번호@aws-1-<region>.pooler.su
 > 트리거를 **추가하지 말 것**).
 
 ### 3) 대상 테이블이 먼저 존재해야 함
-크롤러가 쓰기 전에 메인 앱 쪽에서 `player.player_price_latest` 테이블이 생성돼 있어야 한다
-(백엔드 재배포 시 `create_all` 또는 `alembic upgrade head`).
+크롤러가 쓰기 전에 `player.player_price_strongs` 테이블이 있어야 한다. 메인 저장소
+`Backend/FCOmanager_server/scripts/player_price_strongs.sql` 로 직접 만든다(alembic 아님).
 
 ---
 
@@ -289,7 +293,7 @@ count=6                     # ← 이 숫자 = 위 cron 줄 수
 ## 검증 순서
 1. 수동 실행 + `limit=20`, `strongs=1` → 동작 확인.
 2. 전체 1회 실행 → 소요시간 측정 → 샤드/워커 수 튜닝, 차단 없는지 확인.
-3. DB 에 `player.player_price_latest` 행이 쌓였는지 확인 → 앱에서 강화단계+가격 필터 검색 결과 확인.
+3. DB 에 `player.player_price_strongs` 행이 쌓였는지 확인 → 앱에서 강화단계+가격 필터 검색 결과 확인.
 4. cron 으로 매일 자동 실행 확인.
 
 > 표가 채워지기 전에는 가격필터 검색 결과 0건이 정상이다.

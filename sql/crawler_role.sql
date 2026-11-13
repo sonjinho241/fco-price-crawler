@@ -6,7 +6,7 @@
 --       딱 필요한 권한만 가진 전용 롤의 접속문자열을 써야 한다).
 --
 -- 이 롤이 할 수 있는 것:
---   시세 크롤러: player.players 읽기 + player.player_price_latest·player_price_strongs 읽기/쓰기
+--   시세 크롤러: player.players 읽기 + player.player_price_strongs 읽기/쓰기
 --   메타 크롤러: player 스키마의 선수/시즌/spid/레퍼런스 테이블 읽기/쓰기 (아래 4번)
 --
 -- ⚠️ 아래 비밀번호 자리는 실행할 때만 강력한 값으로 바꾸고, 이 파일에 평문으로
@@ -19,10 +19,11 @@ create role fco_crawler with login password 'CHANGE-ME-강력한-비밀번호';
 grant connect on database postgres to fco_crawler;   -- Supabase 기본 DB명 = postgres
 grant usage   on schema   player   to fco_crawler;
 
--- 3) 딱 필요한 테이블 권한만 (player_price_latest 의 upsert = INSERT + UPDATE)
+-- 3) 딱 필요한 테이블 권한만 (upsert = INSERT + UPDATE)
 grant select               on player.players              to fco_crawler;
-grant select, insert, update on player.player_price_latest to fco_crawler;
 -- 카드당 한 행 시세 표(2026-10-27). 표 정의는 메인 저장소 scripts/player_price_strongs.sql.
+-- (옛 표 player_price_latest 는 2026-11-13 쓰기를 끊었다 — 표를 지운 뒤 이 파일을 다시 돌려도
+--  깨지지 않도록 grant 줄을 뺐다. 되살리지 말 것.)
 grant select, insert, update on player.player_price_strongs to fco_crawler;
 
 -- 4) 메타 크롤러(meta_crawler.py) 권한 — 목/금 메타 자동화(2026-07)에서 추가.
@@ -39,7 +40,7 @@ grant select, insert         on player.meta_crawl_log to fco_crawler;
 grant usage, select on all sequences in schema player to fco_crawler;
 
 -- (참고) 권한 회수가 필요하면:
---   revoke all on player.player_price_latest from fco_crawler;
+--   revoke all on player.player_price_strongs from fco_crawler;
 --   revoke all on player.players              from fco_crawler;
 --   drop role fco_crawler;
 --

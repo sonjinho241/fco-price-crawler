@@ -3,7 +3,7 @@ FC Online 선수 "최신 시세만" 크롤러 — 공개 저장소용 자기완�
 
 GitHub Actions(공개 저장소 = Actions 분 무제한)에서 한 실행이 5시간 30분 머물며 시각 버킷을 차례로
 받고, 끝날 때 다음 실행을 스스로 띄운다(crawl.yml). 넥슨에서 선수×강화단계당
-'가장 최근 1줄'만 받아 player.player_price_latest 와 player.player_price_strongs 에 upsert 한다.
+'가장 최근 1줄'만 받아 player.player_price_strongs(카드당 한 행)에 upsert 한다.
 멱등(idempotent)하므로 중간에 죽어도 다시 돌리면 이어서 채워진다.
 
 ⚠️ 2026-10-30 부터 카드를 두 묶음으로 나눠 돈다(이전: 전 카드를 하루 6토막, 토막당 35 req/s 로
@@ -24,9 +24,10 @@ GitHub Actions(공개 저장소 = Actions 분 무제한)에서 한 실행이 5�
    예산(기본 330분) 안에 다음 버킷을 못 끝내면 멈추고, 워크플로가 다음 실행을 바로 이어 띄운다.
    cron 은 사슬이 끊겼을 때(넥슨 차단으로 실패한 실행은 잇지 않는다) 다시 잇는 예비다.
 
-⚠️ 2026-10-27 부터 두 표에 함께 쓴다(전환 기간). player_price_strongs 는 카드당 한 행에
-   강화 1~13단계를 배열로 담는 새 표(115만 행·159MB → 8.8만 행·22MB)이고, 앱 서버가 그 표로
-   옮겨 가면 player_price_latest 쓰기를 지운다. 표 정의는 메인 저장소
+⚠️ 2026-11-13 부터 player_price_strongs 하나에만 쓴다. 카드당 한 행에 강화 1~13단계를 배열로
+   담는 표다. 2026-10-27~11-13 은 (spid, strong) 마다 한 행이던 옛 표 player_price_latest(128만 행·
+   144MB)에도 함께 썼는데, 앱 서버는 10-27 부터 새 표만 읽어 옛 표는 쓰기만 남아 있었다(재부팅 뒤
+   WAL 의 약 2/3, DB 무료 한도 500MB 초과의 원인). 표 정의는 메인 저장소
    Backend/FCOmanager_server/scripts/player_price_strongs.sql.
 
 ⚠️ 비밀정보(DATABASE_URL = DB 주소 + 비밀번호)는 절대 이 파일/저장소에 두지 않는다.
@@ -42,7 +43,7 @@ GitHub Actions(공개 저장소 = Actions 분 무제한)에서 한 실행이 5�
     2. 일별 추이 — `var json1 = {time:[...], value:[...]}`. 하루 한 칸이고
        **오늘 칸은 없다**(마지막 칸 = 어제).
 
-  player_price_latest 에 넣을 값은 **1번**이다. 2번의 마지막 칸을 쓰면 하루 늦은
+  player_price_strongs 에 넣을 값은 **1번**이다. 2번의 마지막 칸을 쓰면 하루 늦은
   값이 되어 앱의 검색·가격 필터·구단가치가 실제와 20~30%까지 어긋난다
   (2026-09-28 규명·수정). 메인 저장소 prices/crawler.py 와 동일 로직을 유지한다.
 
@@ -77,19 +78,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import requests
-from sqlalchemy import (
-    BigInteger,
-    Column,
-    Date,
-    DateTime,
-    MetaData,
-    SmallInteger,
-    Table,
-    create_engine,
-    text,
-)
+from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.sql import func
 
 logger = logging.getLogger("price_latest_crawler")
 
@@ -97,19 +87,6 @@ PLAYER_SCHEMA = "player"
 
 # 검색 가능한 선수 목록을 읽어올 테이블(읽기 전용). 이 spid 들에 대해서만 시세를 채운다.
 PLAYERS_TABLE = f'{PLAYER_SCHEMA}.players'
-
-# upsert 대상 테이블. 메인 앱의 prices/models.py / alembic 마이그레이션과 동일 스키마.
-_metadata = MetaData()
-player_price_latest = Table(
-    "player_price_latest",
-    _metadata,
-    Column("spid", BigInteger, primary_key=True),
-    Column("strong", SmallInteger, primary_key=True),
-    Column("price", BigInteger, nullable=False),
-    Column("price_date", Date, nullable=True),
-    Column("updated_at", DateTime(timezone=True), server_default=func.now()),
-    schema=PLAYER_SCHEMA,
-)
 
 
 # =============================================================================
@@ -304,25 +281,11 @@ def write_last_bucket(engine, bucket_at: datetime) -> None:
 # pg_stat_statements 가 배치 크기별로 또 별개 엔트리를 만든다(4,283 엔트리/59MB).
 # 반드시 _pg_array_literal() 로 '{...}' 문자열 하나로 직렬화해 넘겨야
 # 상수가 항상 1개($1)가 된다.
-_UPSERT_LATEST_SQL = text(f"""
-    INSERT INTO {PLAYER_SCHEMA}.player_price_latest (spid, strong, price, price_date)
-    SELECT * FROM unnest(
-        CAST(:spids AS bigint[]),
-        CAST(:strongs AS smallint[]),
-        CAST(:prices AS bigint[]),
-        CAST(:price_dates AS date[])
-    )
-    ON CONFLICT (spid, strong) DO UPDATE SET
-        price = EXCLUDED.price,
-        price_date = EXCLUDED.price_date,
-        updated_at = now()
-    WHERE player_price_latest.price IS DISTINCT FROM EXCLUDED.price
-""")
-
+#
 # 카드당 한 행(player_price_strongs)에 강화단계별 값을 끼워 넣는다. 들어온 (spid, strong) 만
 # 바꾸고 나머지 단계는 기존 값을 둔다(넥슨 호출이 실패한 단계는 아예 안 온다). 날짜는 값이
-# 실제로 바뀐 단계만 새 날짜로 바뀐다. 배열 전체가 같으면 UPDATE 를 건너뛴다(옛 표와 같은
-# no-op skip). 메인 저장소 prices/crud.py 의 _UPSERT_LATEST_SQL 과 같은 텍스트를 유지한다.
+# 실제로 바뀐 단계만 새 날짜로 바뀐다. 배열 전체가 같으면 UPDATE 를 건너뛴다(no-op skip).
+# 메인 저장소 prices/crud.py 의 _UPSERT_LATEST_SQL(이름만 옛것, 내용은 이 표) 과 같은 텍스트를 유지한다.
 _UPSERT_STRONGS_SQL = text(f"""
     WITH incoming AS (
         SELECT * FROM unnest(
@@ -377,16 +340,19 @@ _DB_MAX_RETRIES = 4
 
 
 def bulk_upsert_latest(engine, rows: List[dict]) -> Tuple[int, int]:
-    """최신 시세들을 player_price_latest·player_price_strongs 에 한 번에 upsert. 멱등.
-    반환=(시도 행 수, player_price_latest 에서 실제로 바뀐 행 수).
+    """최신 시세들을 player_price_strongs 에 한 번에 upsert. 멱등.
+    반환=(시도 행 수, 실제로 쓰인 카드 수 = 새로 들어왔거나 13단계 배열이 바뀐 spid 수).
 
-    rows 안에 같은 (spid, strong) 가 두 번 들어오면 안 된다(새 표의 배열 길이 CHECK 에 걸린다).
+    ⚠️ 2026-11-13 전까지 두 번째 값은 옛 표 기준 "바뀐 (spid, strong) 칸 수"였다. 이제는 카드
+    수라 같은 배치에서 더 작게 나온다. 진행 로그와 VACUUM 여부(0 보다 큰지)에만 쓰인다.
 
-    price 가 기존 값과 같으면 ON CONFLICT 시 UPDATE 를 건너뛴다
-    (WHERE price IS DISTINCT FROM EXCLUDED.price). 시세는 대부분 날마다 안 바뀌는데,
+    rows 안에 같은 (spid, strong) 가 두 번 들어오면 안 된다(배열 길이 CHECK 에 걸린다).
+
+    배열이 기존 값과 같으면 ON CONFLICT 시 UPDATE 를 건너뛴다
+    (WHERE prices IS DISTINCT FROM EXCLUDED.prices). 시세는 대부분 날마다 안 바뀌는데,
     안 바뀐 행까지 매번 다시 쓰면 dead tuple + WAL 이 쌓여 Supabase 의
-    Disk IO 예산을 갉아먹는다. 그래서 값이 실제로 변한 행만 쓴다. 이 때문에 updated_at 의
-    의미는 "마지막 확인 시각"이 아니라 "마지막으로 price 가 바뀐 시각"이 된다.
+    Disk IO 예산을 갉아먹는다. 그래서 값이 실제로 변한 행만 쓴다. 이 때문에 price_dates 의
+    각 칸은 "마지막 확인 날짜"가 아니라 "그 단계 값이 마지막으로 바뀐 날짜"다.
 
     ⚠️ 2026-09-28 부터 price 가 일별 추이 마지막 칸이 아니라 넥슨 "현재가"다.
     현재가는 2시간마다 움직이므로 하루 1회만 바뀌던 예전보다 **이 조건을 통과하는
@@ -412,10 +378,9 @@ def bulk_upsert_latest(engine, rows: List[dict]) -> Tuple[int, int]:
     }
     for attempt in range(_DB_MAX_RETRIES):
         try:
-            # 두 표를 한 트랜잭션에 쓴다. 재시도해도 둘 다 멱등이라 안전하다.
+            # 멱등이라 재시도해도 안전하다.
             with engine.connect() as conn:
-                changed = conn.execute(_UPSERT_LATEST_SQL, params).rowcount
-                conn.execute(_UPSERT_STRONGS_SQL, params)
+                changed = conn.execute(_UPSERT_STRONGS_SQL, params).rowcount
                 conn.commit()
             return len(rows), max(0, changed or 0)
         except OperationalError as exc:
@@ -438,15 +403,14 @@ def vacuum_analyze(engine) -> None:
     no-op skip 으로 dead 생성은 이미 줄였지만, 바뀐 가격만큼은 매 회차 dead 가
     생긴다. autovacuum 데몬을 기다리지 않고 쓰기 직후 한 번 VACUUM 해서, 비운 공간을
     테이블 내부에서 곧장 재사용하게 만든다 → high-water mark(파일 크기) 가 다시
-    부풀지 않는다. ANALYZE 까지 묶어 (strong, price) 인덱스 통계도 최신으로 유지.
+    부풀지 않는다. ANALYZE 까지 묶어 플래너 통계도 최신으로 유지.
     dead 가 적으면 visibility map 으로 깨끗한 페이지를 건너뛰므로 매우 가볍다.
 
     ⚠️ VACUUM 은 트랜잭션 블록 안에서 못 돈다. AUTOCOMMIT 커넥션으로 실행한다.
     ⚠️ VACUUM FULL 이 아니다(배타 락 없음). 일상 회수용이라 검색/배치를 막지 않는다.
     """
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        for table in ("player_price_latest", "player_price_strongs"):
-            conn.execute(text(f"VACUUM (ANALYZE) {PLAYER_SCHEMA}.{table}"))
+        conn.execute(text(f"VACUUM (ANALYZE) {PLAYER_SCHEMA}.player_price_strongs"))
 
 
 # =============================================================================
@@ -843,7 +807,7 @@ def run_buckets(engine, crawler: Crawler, budget: float, new_cap: int, sleep=tim
 def _vacuum(engine) -> None:
     try:
         vacuum_analyze(engine)
-        logger.info("VACUUM (ANALYZE) 완료: %s.player_price_latest·player_price_strongs", PLAYER_SCHEMA)
+        logger.info("VACUUM (ANALYZE) 완료: %s.player_price_strongs", PLAYER_SCHEMA)
     except Exception as exc:  # 청소 실패가 배치 성공을 뒤집지 않게.
         logger.warning("VACUUM 스킵(실패): %s", exc)
 
